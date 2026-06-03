@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=MailStore Export
+Comment=Esporta gli archivi MailStore in file .eml (Web API)
+# Linux: edit these two absolute paths to where you copied the project, then
+#   chmod +x run_gui.sh  and  double-click this file (or: install to ~/.local/share/applications/)
+Exec=/percorso/del/progetto/run_gui.sh
+Icon=/percorso/del/progetto/app_icon.png
+Terminal=false
+Categories=Utility;Network;

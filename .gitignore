@@ -1,0 +1,42 @@
+# --- Secrets / credentials (NEVER commit) ---
+.env
+
+# --- Export output & state (private email data, large) ---
+*.eml
+*.eml.tmp
+.mailstore_export/
+.mailstore_webapi_export/
+.metadata_never_index
+state.db
+state.db-*
+
+# --- Generated reports / dumps (private data) ---
+mailstore_search_*.json
+mailstore_search_*.log
+mailstore_benchmark_*.json
+mailstore_analysis_*.json
+mailstore_analysis_output/
+mailstore_webapi_export/
+export_*.log
+
+# --- Build artifacts ---
+app_icon.iconset/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- AI assistant context (local only) ---
+CLAUDE.md
+.claude/
+
+# --- macOS ---
+.DS_Store
+
+# --- Editors ---
+.idea/
+.vscode/
+*.swp

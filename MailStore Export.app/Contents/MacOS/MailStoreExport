@@ -1,0 +1,12 @@
+#!/bin/zsh
+# Launcher of the MailStore Export GUI (double-click the .app in Finder).
+# Portable: resolves the repo root relative to the .app and finds a Python with
+# a working Tk (Homebrew python3.12 on macOS; the system 3.9 Tk is broken).
+DIR="$(cd "$(dirname "$0")/../../.." && pwd)"   # repo root holding the .app
+for PY in /opt/homebrew/bin/python3.12 /usr/local/bin/python3.12 python3.12 python3; do
+  if command -v "$PY" >/dev/null 2>&1; then
+    exec "$PY" "$DIR/mailstore_gui.py"
+  fi
+done
+osascript -e 'display alert "Python mancante" message "macOS: brew install python-tk@3.12"'
+exit 1
