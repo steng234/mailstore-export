@@ -18,7 +18,7 @@ are welcome — bug reports, fixes, features, and documentation.
 ## Development setup
 
 ```bash
-git clone https://github.com/<you>/mailstore-export.git
+git clone https://github.com/steng234/mailstore-export.git
 cd mailstore-export
 cp .env.example .env   # fill in your own test server
 ```
@@ -27,15 +27,20 @@ The GUI needs a Python with a working Tk (see the README for per-OS notes).
 
 ## Before opening a pull request
 
-1. **Compile-check on both interpreters** you target:
+1. **Compile-check** every module:
    ```bash
-   python3 -m py_compile mailstore_*.py
+   python3 -m py_compile mailstore_*.py make_icon.py
    ```
-2. **Smoke-test what you touched.** For GUI changes, launch the app and exercise
+2. **Run the test suite** (stdlib only, no network):
+   ```bash
+   python3 -m unittest discover -s tests -v
+   ```
+   If you add or change a pure helper, add a test for it under `tests/`.
+3. **Smoke-test what you touched.** For GUI changes, launch the app and exercise
    the affected widgets. For exporter changes, run a small export against a test
    archive.
-3. Keep changes focused and described clearly in the PR.
-4. Match the surrounding code style (naming, comments in English, log messages
+4. Keep changes focused and described clearly in the PR.
+5. Match the surrounding code style (naming, comments in English, log messages
    in English).
 
 ## Reporting bugs

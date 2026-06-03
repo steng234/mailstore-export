@@ -23,34 +23,18 @@ jobs:
       - name: Byte-compile all modules
         run: python -m py_compile mailstore_export.py mailstore_webapi_export.py mailstore_search.py mailstore_webapi_probe.py mailstore_gui.py make_icon.py
 
-  smoke:
-    name: Smoke test (pure functions)
+  test:
+    name: unittest (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-      - name: Test core helpers (no network)
-        run: |
-          python - <<'PY'
-          import importlib.util
-          from datetime import datetime
-
-          def load(name, path):
-              s = importlib.util.spec_from_file_location(name, path)
-              m = importlib.util.module_from_spec(s); s.loader.exec_module(m); return m
-
-          mx = load("mx", "mailstore_export.py")
-          assert mx.sanitize_component('foo:bar/baz') == 'foo_bar_baz'
-          assert mx.decode_subject('=?utf-8?Q?Caf=C3=A9?=') == 'Café'
-          assert mx.parse_list_response(b'(\\HasNoChildren) "/" "INBOX"') == 'INBOX'
-          fn = mx.build_filename(datetime(2023, 5, 15, 14, 30, 45),
-                                 'Re: Fattura n.123', 'abc123def456')
-          assert fn == 'Re_ Fattura n.123_20230515_143045_abc123de.eml', fn
-
-          cli = load("cli", "mailstore_webapi_export.py")
-          assert cli._item_year_month({"date": "2023-05-15T14:30:45Z"}) == (2023, 5)
-          assert cli._item_year_month({}) == (None, None)
-          print("smoke OK")
-          PY
+          python-version: ${{ matrix.python-version }}
+      - name: Run the test suite (stdlib only, no network)
+        run: python -m unittest discover -s tests -v

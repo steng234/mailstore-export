@@ -5,6 +5,20 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Test suite** (`tests/`): stdlib `unittest` coverage for the pure helpers —
+  path sanitization, filename building, MIME subject decoding, IMAP `LIST` /
+  `NAMESPACE` parsing, selection parsing, `.env` loading, and date helpers.
+- **CI**: the suite now runs on Python 3.9 → 3.13 alongside `py_compile`.
+
+### Changed
+
+- README: terminal-styled header, status badges, a tests section, and author info.
+- Project authorship and license set to Stefan Anghel ([@steng234](https://github.com/steng234)).
+
 ## [1.0.0] — 2026-06-03
 
 ### Added
@@ -24,4 +38,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (macOS/Linux), `run_gui.bat` / `run_gui.vbs` (Windows).
 - **Icon generator** (`make_icon.py`) producing PNG / ICO / ICNS — pure stdlib.
 
-[1.0.0]: https://github.com/<you>/mailstore-export/releases/tag/v1.0.0
+[Unreleased]: https://github.com/steng234/mailstore-export/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/steng234/mailstore-export/releases/tag/v1.0.0
