@@ -66,26 +66,9 @@ babysitting — and it did.
 
 ## The GUI
 
-A dark, terminal-styled front-end (multi-language). Rough layout:
+A dark, terminal-styled front-end (multi-language):
 
-```
-mailstore@export:~$ ./mailstore_export --webapi            [ IT ][ EN ][ ES ][ FR ]
-> CONNESSIONE
-  Host [mailstore.local ]  Porta [8462]
-  Utente [admin]           Password [••••••]      [ carica .env ] [ test & carica archivi ]
-> OUTPUT E OPZIONI
-  Cartella output [/Volumes/Backup/eml_export        ]   [ sfoglia… ]
-  [x] Dedup per Message-ID   [x] Suddividi per anno   [x] Conta prima (barra precisa)
-> PERIODO · ANNI / MESI
-  Anni [ 2023, 2024  ▾ ]     Mesi [ Tutti i mesi  ▾ ]
-> ARCHIVI
-  [ sel. tutti ] [ desel. tutti ]   (🔎 cerca…)
-  [x] admin   [x] sales   [x] support   [x] legal   [x] hr
-  ▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░  45.0%  ·  1,120,344 / 2,510,285 msg  ·  118 msg/s  ·  ETA 3h 12m
-  [ ▶ EXPORT ] [ analizza ] [ benchmark ] [ scan .tmp ] [ lista falliti ]   [ ■ STOP ]
-```
-
-> A real screenshot is welcome — feel free to open a PR adding one under `docs/`.
+![MailStore Export GUI](docs/screenshot.png)
 
 ## Requirements
 
