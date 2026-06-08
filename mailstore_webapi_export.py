@@ -1408,6 +1408,32 @@ def _cleanup_orphan_tmp(root: Path, logger: logging.Logger) -> None:
                     deleted, failed)
 
 
+def _format_oserror(e: OSError) -> str:
+    """Stringa diagnostica compatta di un OSError, con WinError su Windows.
+
+    Esempi: 'WinError 32 (file in uso) [C:\\...\\x.eml.tmp]',
+            'errno 13 EACCES Permission denied [/Volumes/.../x.eml.tmp]'.
+    Pensata per i log: rende ovvio se è un lock AV/sync (Win 32/5) o permessi.
+    """
+    parts: list[str] = []
+    winerr = getattr(e, 'winerror', None)
+    if winerr is not None:
+        hint = {5: 'accesso negato', 32: 'file in uso (lock AV/sync?)',
+                33: 'lock su porzione di file'}.get(winerr, '')
+        parts.append(f'WinError {winerr}' + (f' ({hint})' if hint else ''))
+    if getattr(e, 'errno', None) is not None:
+        import errno as _errno
+        name = _errno.errorcode.get(e.errno, '')
+        parts.append(f'errno {e.errno}{(" " + name) if name else ""}')
+    if getattr(e, 'strerror', None):
+        parts.append(str(e.strerror))
+    s = ' '.join(parts) if parts else str(e)
+    fn = getattr(e, 'filename', None)
+    if fn:
+        s += f' [{fn}]'
+    return s
+
+
 def _atomic_write_with_retry(tmp: Path, target: Path, raw: bytes,
                              logger: logging.Logger) -> int:
     """Write raw to tmp + fsync + rename to target, with retry on transient OSError.
@@ -1416,29 +1442,41 @@ def _atomic_write_with_retry(tmp: Path, target: Path, raw: bytes,
     hold brief locks on newly-created files. With many concurrent workers writing
     to one directory this surfaces as EACCES on open() or os.replace().
     Returns number of retries needed (0 = first attempt succeeded).
+
+    Logging (tutto marcato [WRITE] per essere greppabile):
+      - successo dopo >=1 retry -> INFO (mostra che un lock transitorio è stato
+        superato, con quanti tentativi sono serviti);
+      - fallimento definitivo   -> ERROR con WinError/errno e path completo;
+      - i singoli retry          -> DEBUG (per non inondare il log).
     """
-    for attempt in range(len(_TMP_WRITE_BACKOFF) + 1):
+    max_retries = len(_TMP_WRITE_BACKOFF)
+    for attempt in range(max_retries + 1):
         try:
             with open(tmp, 'wb') as f:
                 f.write(raw)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, target)
+            if attempt:
+                logger.info('[WRITE] OK dopo %d retry (lock transitorio '
+                            'superato): %s', attempt, target.name)
             return attempt
         except OSError as e:
             try:
                 tmp.unlink(missing_ok=True)
             except OSError:
                 pass
-            if attempt < len(_TMP_WRITE_BACKOFF):
-                logger.debug('Retry %d/%d per %s (errno=%s)',
-                             attempt + 1, len(_TMP_WRITE_BACKOFF),
-                             target.name, e.errno)
+            if attempt < max_retries:
+                logger.debug('[WRITE] retry %d/%d -> %s',
+                             attempt + 1, max_retries, _format_oserror(e))
                 # jitter: spalma le retry di N worker simultanei
                 time.sleep(_TMP_WRITE_BACKOFF[attempt] + random.uniform(0, 0.02))
                 continue
+            logger.error('[WRITE] FALLITA dopo %d retry (probabile lock '
+                         'persistente AV/sync su Windows) -> %s',
+                         max_retries, _format_oserror(e))
             raise
-    return len(_TMP_WRITE_BACKOFF)
+    return max_retries
 
 
 def download_and_save(client: WebClient, item: dict, archive: str,
@@ -2728,6 +2766,15 @@ def main():
     logger.info('=' * 60)
     logger.info(f'Avvio export Web API: host={host}:{port} '
                 f'archives={len(archives)} workers={workers} output={output_root}')
+    logger.info('Piattaforma: %s | Python %s', sys.platform,
+                sys.version.split()[0])
+    if os.name == 'nt':
+        logger.info('Windows rilevato: se vedi righe "[WRITE] FALLITA" con '
+                    'WinError 32/5, è un lock di Defender/antivirus o di un '
+                    'agente di sync (OneDrive) sulla cartella di output. '
+                    'Aggiungi la cartella alle ESCLUSIONI dell\'antivirus e '
+                    'disattiva la sync su quella cartella. Cerca i marcatori '
+                    '[WRITE] nel log per il dettaglio.')
 
     # Cleanup .eml.tmp orfani da run precedenti: open('wb') li sovrascriverebbe
     # solo se non lockati, e con 48 worker il rumore in log esplode. Meglio

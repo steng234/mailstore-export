@@ -500,5 +500,36 @@ class TestCountYearsInSorted(unittest.TestCase):
                          (0, []))
 
 
+# ============================================================
+# _format_oserror (log diagnostici Windows/POSIX)
+# ============================================================
+
+class TestFormatOSError(unittest.TestCase):
+    def test_posix_errno_and_filename(self):
+        e = OSError(13, 'Permission denied', '/Volumes/X/a.eml.tmp')
+        s = wex._format_oserror(e)
+        self.assertIn('errno 13', s)
+        self.assertIn('EACCES', s)
+        self.assertIn('/Volumes/X/a.eml.tmp', s)
+
+    def test_winerror_file_in_use_hint(self):
+        # Simula un OSError stile Windows (WinError 32 = file in uso / lock)
+        e = OSError()
+        e.winerror = 32
+        e.errno = 13
+        e.filename = r'C:\export\msg.eml.tmp'
+        s = wex._format_oserror(e)
+        self.assertIn('WinError 32', s)
+        self.assertIn('file in uso', s)
+        self.assertIn(r'C:\export\msg.eml.tmp', s)
+
+    def test_winerror_access_denied_hint(self):
+        e = OSError()
+        e.winerror = 5
+        s = wex._format_oserror(e)
+        self.assertIn('WinError 5', s)
+        self.assertIn('accesso negato', s)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
