@@ -23,6 +23,7 @@ import email.policy
 import email.utils
 import getpass
 import hashlib
+import http.client
 import http.cookiejar
 import json
 import logging
@@ -283,7 +284,15 @@ class WebClient:
                         auth_retried = True
                         continue
                     raise AuthExpired(401, 'Token scaduto o non valido', body)
-                if status in (502, 503, 504) and attempt < 2:
+                # Retry transitorio su 5xx (server temporaneamente occupato).
+                # Eccezione: il 500 "cached search expired" NON va ritentato qui,
+                # va gestito a monte ricreando la search (vedi export_folder).
+                # NB: alcuni 500 sono permanenti ("could not be entirely
+                # retrieved from the archive" = messaggio corrotto nello storage):
+                # un retry in più è innocuo e li lascia comunque fallire.
+                transient_5xx = status in (502, 503, 504) or (
+                    status == 500 and b'cached search' not in body.lower())
+                if transient_5xx and attempt < 2:
                     last_err = e
                     time.sleep(1.0 * (attempt + 1))
                     continue
@@ -294,7 +303,17 @@ class WebClient:
                 except Exception:
                     pass
                 raise ApiError(status, msg, body)
-            except (urllib.error.URLError, TimeoutError, OSError) as e:
+            except http.client.IncompleteRead as e:
+                # Body HTTP troncato a metà download (rete instabile o server che
+                # chiude la connessione). IncompleteRead NON è un OSError: senza
+                # questo ramo dedicato non verrebbe MAI ritentata. Retry+backoff.
+                last_err = e
+                if attempt < 2:
+                    time.sleep(1.0 * (attempt + 1))
+                    continue
+                raise ApiError(0, f'Download troncato (IncompleteRead): {e}', b'')
+            except (urllib.error.URLError, TimeoutError, OSError,
+                    http.client.HTTPException) as e:
                 last_err = e
                 if attempt < 2:
                     time.sleep(1.0 * (attempt + 1))
@@ -497,10 +516,21 @@ class WebApiStateDB(StateDB):
             conn.execute("ALTER TABLE exported_api ADD COLUMN message_id TEXT")
         except sqlite3.OperationalError:
             pass  # colonna già esistente
+        # 2b) Migrazione: aggiungi status (codice HTTP) a failed_messages.
+        #     0 = errore non-HTTP (rete, IncompleteRead, body vuoto, ecc.).
+        try:
+            conn.execute(
+                "ALTER TABLE failed_messages ADD COLUMN status INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # colonna già esistente
         # 3) Solo ora l'indice su message_id può essere creato in sicurezza
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_api_message_id "
             "ON exported_api(message_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_failed_status "
+            "ON failed_messages(status)"
         )
         conn.commit()
 
@@ -557,11 +587,13 @@ class WebApiStateDB(StateDB):
 
     def mark_api_failed(self, gid: int, mid: int, archive: str, folder: str,
                         subject: str, email_date: str,
-                        error_type: str, error_msg: str) -> None:
+                        error_type: str, error_msg: str,
+                        status: int = 0) -> None:
         """Registra (o aggiorna) un fallimento permanente per gid/mid.
 
+        `status` è il codice HTTP (0 se errore non-HTTP: rete, IncompleteRead…).
         Se la chiave esiste già, incrementa attempts e aggiorna last_seen ed
-        error_type/error_msg (l'ultimo errore vince).
+        error_type/error_msg/status (l'ultimo errore vince).
         """
         key = f'{gid}/{mid}'
         now = time.time()
@@ -569,17 +601,71 @@ class WebApiStateDB(StateDB):
         conn.execute(
             'INSERT INTO failed_messages '
             '(api_key, gid, mid, archive, folder, subject, email_date, '
-            'error_type, error_msg, first_seen, last_seen, attempts) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1) '
+            'error_type, error_msg, status, first_seen, last_seen, attempts) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1) '
             'ON CONFLICT(api_key) DO UPDATE SET '
             '  last_seen = excluded.last_seen, '
             '  error_type = excluded.error_type, '
             '  error_msg = excluded.error_msg, '
+            '  status = excluded.status, '
             '  attempts = failed_messages.attempts + 1',
             (key, gid, mid, archive, folder, subject, email_date,
-             error_type, error_msg, now, now)
+             error_type, error_msg, int(status), now, now)
         )
         conn.commit()
+
+    def clear_failed(self, gid: int, mid: int) -> None:
+        """Rimuove gid/mid da failed_messages (es. dopo un retry riuscito)."""
+        conn = self._connect()
+        conn.execute('DELETE FROM failed_messages WHERE api_key = ?',
+                     (f'{gid}/{mid}',))
+        conn.commit()
+
+    def failed_for_retry(self, archive: str | None = None,
+                         skip_permanent: bool = False) -> list[dict]:
+        """Righe di failed_messages come item pronti per il re-download.
+
+        Ritorna dict con le chiavi attese da download_and_save: gid, mid,
+        subject, date, folder. Filtra opzionalmente per archivio e/o salta i
+        fallimenti permanenti (messaggio corrotto lato MailStore)."""
+        sql = ('SELECT gid, mid, archive, folder, subject, email_date, '
+               'status, error_type, error_msg FROM failed_messages')
+        params: list = []
+        if archive:
+            sql += ' WHERE archive = ?'
+            params.append(archive)
+        rows = self._connect().execute(sql, params).fetchall()
+        out: list[dict] = []
+        for r in rows:
+            if skip_permanent and _is_permanent_failure(r[6], r[7], r[8]):
+                continue
+            out.append({
+                'gid': r[0], 'mid': r[1], 'archive': r[2], 'folder': r[3],
+                'subject': r[4] or '', 'date': r[5] or '',
+            })
+        return out
+
+    def exported_counts_by_folder(self) -> dict:
+        """Mappa (archive, folder) -> numero di .eml esportati."""
+        cur = self._connect().execute(
+            'SELECT archive, folder, COUNT(*) FROM exported_api '
+            'GROUP BY archive, folder')
+        return {(r[0], r[1]): r[2] for r in cur.fetchall()}
+
+    def failed_counts_by_folder(self) -> dict:
+        """Mappa (archive, folder) -> numero di messaggi falliti."""
+        cur = self._connect().execute(
+            'SELECT archive, folder, COUNT(*) FROM failed_messages '
+            'GROUP BY archive, folder')
+        return {(r[0], r[1]): r[2] for r in cur.fetchall()}
+
+    def all_folder_counts(self) -> list[dict]:
+        """Tutte le righe di folder_counts (count atteso per cartella)."""
+        cur = self._connect().execute(
+            'SELECT archive, folder, found_count FROM folder_counts '
+            'ORDER BY archive, folder')
+        return [{'archive': r[0], 'folder': r[1], 'found': r[2]}
+                for r in cur.fetchall()]
 
     def is_api_failed(self, gid: int, mid: int) -> bool:
         cur = self._connect().execute(
@@ -596,31 +682,48 @@ class WebApiStateDB(StateDB):
         """Ritorna tutta la tabella failed_messages come list of dict."""
         cur = self._connect().execute(
             'SELECT gid, mid, archive, folder, subject, email_date, '
-            'error_type, error_msg, first_seen, last_seen, attempts '
+            'error_type, error_msg, status, first_seen, last_seen, attempts '
             'FROM failed_messages ORDER BY archive, folder, email_date')
-        return [{
-            'gid': row[0], 'mid': row[1], 'archive': row[2], 'folder': row[3],
-            'subject': row[4], 'email_date': row[5],
-            'error_type': row[6], 'error_msg': row[7],
-            'first_seen': datetime.fromtimestamp(row[8]).isoformat(timespec='seconds'),
-            'last_seen': datetime.fromtimestamp(row[9]).isoformat(timespec='seconds'),
-            'attempts': row[10],
-        } for row in cur.fetchall()]
+        out = []
+        for row in cur.fetchall():
+            status = row[8] or 0
+            out.append({
+                'gid': row[0], 'mid': row[1], 'archive': row[2],
+                'folder': row[3], 'subject': row[4], 'email_date': row[5],
+                'error_type': row[6], 'error_msg': row[7],
+                'status': status,
+                'permanent': _is_permanent_failure(status, row[6], row[7]),
+                'first_seen': datetime.fromtimestamp(row[9]).isoformat(timespec='seconds'),
+                'last_seen': datetime.fromtimestamp(row[10]).isoformat(timespec='seconds'),
+                'attempts': row[11],
+            })
+        return out
 
     def failed_stats(self) -> dict:
-        """Conteggi e breakdown per error_type."""
+        """Conteggi e breakdown per error_type, status HTTP e archivio."""
         conn = self._connect()
         total = conn.execute(
             'SELECT COUNT(*) FROM failed_messages').fetchone()[0]
         by_type = conn.execute(
             'SELECT error_type, COUNT(*) FROM failed_messages '
             'GROUP BY error_type ORDER BY 2 DESC').fetchall()
+        by_status = conn.execute(
+            'SELECT COALESCE(status, 0), COUNT(*) FROM failed_messages '
+            'GROUP BY status ORDER BY 2 DESC').fetchall()
         by_archive = conn.execute(
             'SELECT archive, COUNT(*) FROM failed_messages '
             'GROUP BY archive ORDER BY 2 DESC').fetchall()
+        # Permanente vs transitorio: serve leggere status+type+msg riga per riga.
+        rows = conn.execute(
+            'SELECT COALESCE(status, 0), error_type, error_msg '
+            'FROM failed_messages').fetchall()
+        permanent = sum(1 for r in rows if _is_permanent_failure(r[0], r[1], r[2]))
         return {
             'count': total,
+            'permanent': permanent,
+            'transient': total - permanent,
             'by_error_type': [{'type': r[0], 'count': r[1]} for r in by_type],
+            'by_status': [{'status': r[0], 'count': r[1]} for r in by_status],
             'by_archive': [{'archive': r[0], 'count': r[1]} for r in by_archive],
         }
 
@@ -1072,21 +1175,28 @@ def _dump_failed_messages(state: WebApiStateDB, json_out: Path | None) -> int:
     report = {
         'generated_at': datetime.now().isoformat(timespec='seconds'),
         'count': stats['count'],
+        'permanent': stats['permanent'],
+        'transient': stats['transient'],
         'email_date_min': email_min,
         'email_date_max': email_max,
         'by_error_type': stats['by_error_type'],
+        'by_status': stats['by_status'],
         'by_archive': stats['by_archive'],
         'messages': rows,
     }
 
-    if json_out is not None:
-        json_out = json_out.expanduser().resolve()
-        with open(json_out, 'w', encoding='utf-8') as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
-        print(f'Report salvato: {json_out}')
+    def _print_summary():
         print(f'  Messaggi falliti:   {stats["count"]:,}')
+        print(f'    • permanenti:     {stats["permanent"]:,} '
+              f'(corrotti lato MailStore, retry inutile)')
+        print(f'    • transitori:     {stats["transient"]:,} '
+              f'(rete/IncompleteRead/500 temporaneo, recuperabili con --retry-failed)')
         if email_min and email_max:
             print(f'  Email date min/max: {email_min}  /  {email_max}')
+        if stats['by_status']:
+            print('  Per status HTTP (0 = errore di rete/non-HTTP):')
+            for e in stats['by_status']:
+                print(f'    {e["count"]:>6}  HTTP {e["status"]}')
         if stats['by_error_type']:
             print('  Per tipo errore:')
             for e in stats['by_error_type']:
@@ -1095,7 +1205,21 @@ def _dump_failed_messages(state: WebApiStateDB, json_out: Path | None) -> int:
             print('  Per archivio:')
             for e in stats['by_archive']:
                 print(f'    {e["count"]:>6}  {e["archive"]}')
+
+    if json_out is not None:
+        json_out = json_out.expanduser().resolve()
+        with open(json_out, 'w', encoding='utf-8') as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+        print(f'Report salvato: {json_out}')
+        _print_summary()
     else:
+        # Senza file: stampiamo PRIMA un riepilogo leggibile (utile nella GUI),
+        # poi il JSON completo su stdout per gli script.
+        print('=' * 60)
+        print('MESSAGGI FALLITI (failed_messages)')
+        print('=' * 60)
+        _print_summary()
+        print('-' * 60)
         json.dump(report, sys.stdout, indent=2, ensure_ascii=False)
         sys.stdout.write('\n')
 
@@ -1200,9 +1324,11 @@ def download_and_save(client: WebClient, item: dict, archive: str,
         try:
             subject = decode_subject(item.get('subject') or '') or ''
             email_date = item.get('date') or ''
+            status = getattr(e, 'status', 0) or 0
             state.mark_api_failed(gid, mid, archive, folder,
                                   subject, email_date,
-                                  type(e).__name__, str(e)[:500])
+                                  type(e).__name__, str(e)[:500],
+                                  status=status)
         except Exception as db_err:
             logger.error('mark_api_failed fallito per %s/%s: %s',
                          gid, mid, db_err)
@@ -1486,6 +1612,23 @@ def _is_cached_search_expired(err: Exception) -> bool:
         return False
     msg = (err.message or '').lower()
     return err.status == 500 and 'cached search' in msg
+
+
+def _is_permanent_failure(status: int, error_type: str, error_msg: str) -> bool:
+    """True se il fallimento è verosimilmente PERMANENTE (ritentare non aiuta).
+
+    Caso tipico: HTTP 500 "The message could not be entirely retrieved from the
+    archive" = messaggio corrotto/illeggibile nello storage di MailStore stesso.
+    Gli errori di rete (status 0), IncompleteRead e i 502/503/504 sono invece
+    transitori: vale la pena ritentarli (vedi --retry-failed).
+    """
+    # Il segnale primario è il TESTO del messaggio (specifico e affidabile anche
+    # su righe legacy salvate prima della colonna status, dove status=0).
+    msg = (error_msg or '').lower()
+    if ('could not be entirely retrieved' in msg
+            or 'not be retrieved from the archive' in msg):
+        return True
+    return False
 
 
 def analyze_folder(client: WebClient, archive: str, folder_path: str,
@@ -1823,6 +1966,329 @@ def run_wizard(defaults: dict) -> dict:
 
 
 # ============================================================
+# DIAGNOSTICA: DOCTOR / RECONCILE / RETRY
+# ============================================================
+
+def _diagnose_archive(client: WebClient, archive: str,
+                      logger: logging.Logger) -> tuple[list[str], list[dict], bool]:
+    """Cammina l'albero cartelle di un archivio segnalando OGNI errore.
+
+    A differenza di list_all_folders() — che scarta in silenzio le sottocartelle
+    in errore (continue) — qui raccogliamo path, status HTTP e messaggio di ogni
+    fallimento. Ritorna (folders, errors, root_empty).
+    """
+    folders: list[str] = []
+    errors: list[dict] = []
+    seen: set[str] = set()
+    queue: list[str | None] = [None]  # None = root
+    root_empty = False
+    while queue:
+        parent = queue.pop(0)
+        try:
+            children = client.get_folders(archive, parent)
+        except AuthExpired:
+            raise
+        except ApiError as e:
+            if parent is None and e.status == 404:
+                root_empty = True
+                continue
+            errors.append({
+                'parent': parent or '(root)',
+                'status': getattr(e, 'status', 0) or 0,
+                'message': (getattr(e, 'message', None) or str(e))[:160],
+            })
+            logger.warning('doctor: %s @ %r -> HTTP %s: %s', archive,
+                           parent, getattr(e, 'status', 0), e)
+            continue
+        for f in children:
+            fp = f.get('fullPath')
+            if not fp or fp in seen:
+                continue
+            seen.add(fp)
+            folders.append(fp)
+            if f.get('hasChildren'):
+                queue.append(fp)
+    return folders, errors, root_empty
+
+
+def run_doctor(client: WebClient, archives: list[str], logger: logging.Logger,
+               json_out: Path | None = None,
+               stop_event: threading.Event | None = None) -> int:
+    """Health-check struttura: enumera archivi/cartelle e rende VISIBILE ogni
+    errore di accesso che l'export normalmente ignora. Ritorna il numero totale
+    di errori di accesso (0 = tutto raggiungibile)."""
+    print('=' * 70)
+    print('DOCTOR — diagnostica struttura archivi')
+    print('=' * 70)
+    try:
+        all_arc = client.get_archives()
+    except AuthExpired:
+        print(f'{sym("✗", "X")} Autenticazione fallita.', file=sys.stderr)
+        return 1
+    except ApiError as e:
+        print(f'{sym("✗", "X")} get_archives fallito: {e}', file=sys.stderr)
+        return 1
+
+    arc_meta = {a.get('name'): a for a in all_arc}
+    targets = archives if archives else [a.get('name') for a in all_arc]
+    print(f'Archivi da controllare: {len(targets)} '
+          f'(su {len(all_arc)} totali sul server)')
+    print()
+
+    report_archives: list[dict] = []
+    total_folders = 0
+    total_errors = 0
+    empty_count = 0
+    for name in targets:
+        if stop_event is not None and stop_event.is_set():
+            break
+        meta = arc_meta.get(name, {})
+        # Archivio dichiarato vuoto dal server: niente cartelle, è normale.
+        if name in arc_meta and not meta.get('containsFolders', True):
+            empty_count += 1
+            print(f'  {sym("◦", "o")} {name}: archivio vuoto (containsFolders=false)')
+            report_archives.append({'archive': name, 'empty': True,
+                                    'folders': 0, 'errors': []})
+            continue
+        try:
+            folders, errors, root_empty = _diagnose_archive(client, name, logger)
+        except AuthExpired:
+            print(f'{sym("✗", "X")} Autenticazione scaduta durante doctor.',
+                  file=sys.stderr)
+            break
+        total_folders += len(folders)
+        total_errors += len(errors)
+        if root_empty:
+            empty_count += 1
+        mark = sym('✓', 'OK') if not errors else sym('✗', 'X')
+        extra = f', {len(errors)} ERRORI di accesso' if errors else ''
+        print(f'  {mark} {name}: {len(folders):,} cartelle{extra}')
+        for er in errors:
+            print(f'        {sym("↳", "->")} HTTP {er["status"]} su '
+                  f'«{er["parent"]}»: {er["message"]}')
+        report_archives.append({'archive': name, 'empty': root_empty,
+                                'folders': len(folders), 'errors': errors})
+
+    print()
+    print('-' * 70)
+    print(f'Archivi controllati:    {len(report_archives)}')
+    print(f'Cartelle raggiungibili: {total_folders:,}')
+    print(f'Archivi vuoti:          {empty_count}')
+    print(f'Errori di accesso:      {total_errors}')
+    if total_errors:
+        print()
+        print(f'{sym("⚠", "!")}  Alcune cartelle NON sono raggiungibili: quella '
+              f'parte di archivio')
+        print('   NON verrebbe esportata. Cause tipiche: HTTP 500 transitorio '
+              '(riprova')
+        print('   il doctor) o permessi/corruzione lato MailStore su quel ramo.')
+    else:
+        print()
+        print(f'{sym("✓", "OK")}  Tutte le cartelle sono raggiungibili.')
+
+    if json_out is not None:
+        report = {
+            'generated_at': datetime.now().isoformat(timespec='seconds'),
+            'host': getattr(client, 'base_url', ''),
+            'archives_checked': len(report_archives),
+            'total_folders': total_folders,
+            'empty_archives': empty_count,
+            'total_access_errors': total_errors,
+            'archives': report_archives,
+        }
+        json_out = json_out.expanduser().resolve()
+        json_out.parent.mkdir(parents=True, exist_ok=True)
+        with open(json_out, 'w', encoding='utf-8') as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+        print(f'\nReport salvato: {json_out}')
+    return total_errors
+
+
+def run_reconcile(state: WebApiStateDB, json_out: Path | None = None) -> dict:
+    """Riconciliazione SOLO da state.db (nessun carico sul server): per ogni
+    cartella confronta atteso (folder_counts) vs esportato vs fallito e calcola
+    il gap. Utile per scoprire dove l'export non ha coperto l'archivio."""
+    folder_counts = state.all_folder_counts()
+    exported = state.exported_counts_by_folder()
+    failed = state.failed_counts_by_folder()
+
+    per_archive: dict[str, dict] = {}
+    folder_gaps: list[dict] = []
+    for fc in folder_counts:
+        a = fc['archive']
+        fpath = fc['folder']
+        exp = fc['found']
+        got = exported.get((a, fpath), 0)
+        fail = failed.get((a, fpath), 0)
+        gap = exp - got - fail
+        d = per_archive.setdefault(
+            a, {'archive': a, 'expected': 0, 'exported': 0,
+                'failed': 0, 'gap': 0, 'folders': 0})
+        d['expected'] += exp
+        d['exported'] += got
+        d['failed'] += fail
+        d['gap'] += gap
+        d['folders'] += 1
+        if gap > 0:
+            folder_gaps.append({'archive': a, 'folder': fpath,
+                                'expected': exp, 'exported': got,
+                                'failed': fail, 'gap': gap})
+
+    archives_sorted = sorted(per_archive.values(),
+                             key=lambda x: x['gap'], reverse=True)
+    folder_gaps.sort(key=lambda x: x['gap'], reverse=True)
+
+    tot_exp = sum(a['expected'] for a in archives_sorted)
+    tot_got = sum(a['exported'] for a in archives_sorted)
+    tot_fail = sum(a['failed'] for a in archives_sorted)
+    tot_gap = sum(a['gap'] for a in archives_sorted)
+
+    print('=' * 70)
+    print('RECONCILE — riconciliazione da state.db')
+    print('=' * 70)
+    print(f'Cartelle tracciate:  {len(folder_counts):,}')
+    print(f'Attesi (search):     {tot_exp:,}')
+    print(f'Esportati (.eml):    {tot_got:,}')
+    print(f'Falliti (DB):        {tot_fail:,}')
+    print(f'GAP non coperti:     {tot_gap:,}')
+    print()
+    print('NB: "atteso" è il count della cartella SENZA filtri. Se hai esportato')
+    print('    con --year/--month, gran parte del GAP è semplicemente "escluso')
+    print('    dal filtro", non "perso". Il dato inequivocabile è "falliti".')
+    print()
+    print('--- Per archivio (ordinati per GAP) ---')
+    print(f'{"GAP":>10} {"falliti":>9} {"esport.":>9} {"atteso":>9}  archivio')
+    for a in archives_sorted:
+        if a['gap'] == 0 and a['failed'] == 0:
+            continue
+        print(f'{a["gap"]:>10,} {a["failed"]:>9,} {a["exported"]:>9,} '
+              f'{a["expected"]:>9,}  {a["archive"]}')
+    if folder_gaps:
+        print()
+        print('--- Top 20 cartelle per GAP ---')
+        for g in folder_gaps[:20]:
+            line = (f'{g["gap"]:>8,}  (fail:{g["failed"]}, '
+                    f'got:{g["exported"]}/{g["expected"]})  '
+                    f'{g["folder"]}')
+            print(line[:130])
+
+    report = {
+        'generated_at': datetime.now().isoformat(timespec='seconds'),
+        'total_expected': tot_exp,
+        'total_exported': tot_got,
+        'total_failed': tot_fail,
+        'total_gap': tot_gap,
+        'by_archive': archives_sorted,
+        'folder_gaps': folder_gaps,
+    }
+    if json_out is not None:
+        json_out = json_out.expanduser().resolve()
+        json_out.parent.mkdir(parents=True, exist_ok=True)
+        with open(json_out, 'w', encoding='utf-8') as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+        print(f'\nReport salvato: {json_out}')
+    return report
+
+
+def run_retry_failed(client: WebClient, state: WebApiStateDB,
+                     output_root: Path, cfg: dict, logger: logging.Logger,
+                     stop_event: threading.Event,
+                     archive_filter: set[str] | None = None,
+                     skip_permanent: bool = False,
+                     workers: int = 8) -> int:
+    """Ri-scarica SOLO i messaggi presenti in failed_messages. Su successo li
+    rimuove dalla tabella; su fallimento aggiorna attempts/status. Ritorna il
+    numero di messaggi recuperati."""
+    items = state.failed_for_retry(skip_permanent=skip_permanent)
+    if archive_filter:
+        items = [it for it in items if it['archive'] in archive_filter]
+
+    if not items:
+        print('Nessun messaggio da ritentare '
+              '(failed_messages vuota o tutti esclusi dai filtri).')
+        return 0
+
+    note = []
+    if archive_filter:
+        note.append(f'archivi: {", ".join(sorted(archive_filter))}')
+    if skip_permanent:
+        note.append('saltati i permanenti')
+    suffix = f' ({"; ".join(note)})' if note else ''
+    print(f'Ri-tento {len(items):,} messaggi falliti{suffix}…')
+
+    try:
+        client._ensure_token()
+    except AuthExpired as e:
+        print(f'{sym("✗", "X")} Login fallito: {e.message}', file=sys.stderr)
+        return 0
+
+    progress = Progress()
+    progress.update(total_msgs=len(items), current_folder='retry-failed')
+    progress.start()
+
+    recovered = 0
+    still = 0
+    counter_lock = threading.Lock()
+
+    def _retry_one(item: dict) -> bool:
+        nonlocal recovered, still
+        if stop_event.is_set():
+            return False
+        try:
+            download_and_save(client, item, item['archive'], output_root,
+                              state, progress, cfg, logger)
+            state.clear_failed(item['gid'], item['mid'])
+            with counter_lock:
+                recovered += 1
+            return True
+        except AuthExpired:
+            stop_event.set()
+            raise
+        except Exception:
+            # download_and_save ha già aggiornato attempts/status nel DB.
+            with counter_lock:
+                still += 1
+            return False
+
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, workers),
+                                thread_name_prefix='retry') as pool:
+            futs = [pool.submit(_retry_one, it) for it in items]
+            for fut in as_completed(futs):
+                if stop_event.is_set():
+                    break
+                try:
+                    fut.result()
+                except AuthExpired:
+                    stop_event.set()
+                    break
+                except Exception:
+                    pass
+    finally:
+        progress.stop()
+
+    remaining = state.failed_stats()
+    print()
+    print('=' * 60)
+    print('RETRY-FAILED COMPLETATO')
+    print('=' * 60)
+    print(f'Ritentati:             {len(items):,}')
+    print(f'{sym("✓", "OK")} Recuperati:          {recovered:,}')
+    print(f'{sym("✗", "X")} Ancora falliti:      {still:,}')
+    print(f'Falliti residui in DB: {remaining["count"]:,} '
+          f'({remaining["permanent"]:,} permanenti, '
+          f'{remaining["transient"]:,} transitori)')
+    if remaining['permanent']:
+        print()
+        print(f'{sym("⚠", "!")}  I {remaining["permanent"]:,} permanenti sono '
+              f'messaggi corrotti lato MailStore:')
+        print('   ritentarli non aiuta. Vanno recuperati/riparati sul server.')
+    logger.info('retry-failed: ritentati=%d recuperati=%d ancora_ko=%d',
+                len(items), recovered, still)
+    return recovered
+
+
+# ============================================================
 # LOGGING
 # ============================================================
 
@@ -1934,6 +2400,29 @@ def main():
     parser.add_argument('--exclude-from', type=Path, default=None,
                         help='Durante l\'export, salta i gid/mid elencati nel '
                              'JSON indicato (formato output di --list-failed).')
+    parser.add_argument('--doctor', action='store_true',
+                        help='Health-check struttura: enumera archivi/cartelle e '
+                             'segnala OGNI errore di accesso (cartelle non '
+                             'raggiungibili) che l\'export ignora in silenzio. '
+                             'Richiede credenziali + --output (per i log).')
+    parser.add_argument('--doctor-output', type=Path, default=None,
+                        help='Con --doctor, salva il report JSON nel path indicato.')
+    parser.add_argument('--reconcile', action='store_true',
+                        help='Riconciliazione SOLO da state.db (no server): '
+                             'atteso vs esportato vs fallito vs mancante, per '
+                             'archivio e cartella. Non richiede credenziali.')
+    parser.add_argument('--reconcile-output', type=Path, default=None,
+                        help='Con --reconcile, salva il report JSON nel path '
+                             'indicato.')
+    parser.add_argument('--retry-failed', action='store_true',
+                        help='Ri-scarica SOLO i messaggi in failed_messages '
+                             '(recupera i fallimenti transitori: rete, '
+                             'IncompleteRead, 500 temporanei). Su successo li '
+                             'rimuove dalla tabella.')
+    parser.add_argument('--retry-skip-permanent', action='store_true',
+                        help='Con --retry-failed, salta i fallimenti permanenti '
+                             '(messaggi corrotti lato MailStore: HTTP 500 '
+                             '"could not be entirely retrieved").')
     args = parser.parse_args()
 
     # Carica .env (CLI args hanno priorità su env)
@@ -1990,6 +2479,21 @@ def main():
         count = _dump_failed_messages(state, args.list_failed_output)
         sys.exit(0 if count == 0 else 1)
 
+    # --reconcile: report di riconciliazione SOLO da state.db. No credenziali.
+    if args.reconcile:
+        if eff_output is None:
+            print('ERROR: --reconcile richiede --output (per trovare lo state.db)',
+                  file=sys.stderr)
+            sys.exit(2)
+        root = eff_output.expanduser().resolve()
+        db_path = root / '.mailstore_webapi_export' / 'state.db'
+        if not db_path.exists():
+            print(f'ERROR: state.db non trovato in {db_path}', file=sys.stderr)
+            sys.exit(2)
+        state = WebApiStateDB(db_path)
+        run_reconcile(state, args.reconcile_output)
+        sys.exit(0)
+
     has_creds = bool(eff_token) or bool(eff_username)
     # In modalità --analyze --analyze-all, gli archivi vengono presi dopo il login.
     # In --benchmark, basta avere le credenziali — output e archivi opzionali.
@@ -2001,6 +2505,10 @@ def main():
         if eff_output is None:
             eff_output = Path.cwd() / 'mailstore_analysis_output'
         missing = not has_creds
+    elif args.doctor or args.retry_failed:
+        # Servono credenziali + output (per state.db/log), ma NON gli archivi:
+        # doctor controlla tutti gli archivi, retry-failed legge failed_messages.
+        missing = not has_creds or eff_output is None
     else:
         missing = not has_creds or eff_output is None or not eff_archives
     use_wizard = args.interactive or (
@@ -2189,6 +2697,39 @@ def main():
             sys.exit(2)
         run_analyze(client, archives, analyze_workers, output_root,
                     stop_event, logger, json_path, include_re, exclude_re)
+        return
+
+    # === DOCTOR MODE ===
+    if args.doctor:
+        try:
+            client._ensure_token()
+        except AuthExpired as e:
+            print(f'{sym("✗", "X")} Login fallito: {e.message}', file=sys.stderr)
+            sys.exit(2)
+        logger.info('DOCTOR MODE: archives=%s', archives or 'ALL')
+        n_err = run_doctor(client, archives, logger,
+                           json_out=args.doctor_output, stop_event=stop_event)
+        # exit code: 0 se tutto raggiungibile, 1 se ci sono errori di accesso
+        sys.exit(0 if n_err == 0 else 1)
+
+    # === RETRY-FAILED MODE ===
+    if args.retry_failed:
+        try:
+            client._ensure_token()
+        except AuthExpired as e:
+            print(f'{sym("✗", "X")} Login fallito: {e.message}', file=sys.stderr)
+            sys.exit(2)
+        retry_cfg = {'workers': workers, 'dedup_message_id': dedup,
+                     'split_by_year': split_by_year,
+                     'years': set(), 'months': set(),
+                     'excluded_keys': set(), 'known_total': False}
+        archive_filter = set(archives) if archives else None
+        logger.info('RETRY-FAILED MODE: archives=%s skip_permanent=%s',
+                    archive_filter or 'ALL', args.retry_skip_permanent)
+        run_retry_failed(client, state, output_root, retry_cfg, logger,
+                         stop_event, archive_filter=archive_filter,
+                         skip_permanent=args.retry_skip_permanent,
+                         workers=workers)
         return
 
     progress = Progress()

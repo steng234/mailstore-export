@@ -403,5 +403,39 @@ class TestTrim(unittest.TestCase):
         self.assertEqual(search._trim('', 70), '')
 
 
+# ============================================================
+# _is_permanent_failure (diagnostica retry)
+# ============================================================
+
+class TestIsPermanentFailure(unittest.TestCase):
+    def test_corrupt_message_500_is_permanent(self):
+        # Il segnale principale è il TESTO, riconosciuto anche con status=500.
+        self.assertTrue(wex._is_permanent_failure(
+            500, 'ApiError',
+            'HTTP 500: The message could not be entirely retrieved from the archive.'))
+
+    def test_corrupt_message_detected_even_with_legacy_status_zero(self):
+        # Righe salvate prima della colonna status hanno status=0: vanno
+        # comunque classificate come permanenti via testo del messaggio.
+        self.assertTrue(wex._is_permanent_failure(
+            0, 'ApiError',
+            'HTTP 500: The message could not be entirely retrieved from the archive.'))
+
+    def test_network_error_is_transient(self):
+        self.assertFalse(wex._is_permanent_failure(
+            0, 'ApiError', 'HTTP 0: Errore di rete: <urlopen error>'))
+
+    def test_incomplete_read_is_transient(self):
+        self.assertFalse(wex._is_permanent_failure(
+            0, 'ApiError', 'Download troncato (IncompleteRead): ...'))
+
+    def test_generic_500_without_corrupt_text_is_transient(self):
+        self.assertFalse(wex._is_permanent_failure(
+            500, 'ApiError', 'HTTP 500: Internal Server Error'))
+
+    def test_empty_message_is_transient(self):
+        self.assertFalse(wex._is_permanent_failure(0, 'RuntimeError', ''))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

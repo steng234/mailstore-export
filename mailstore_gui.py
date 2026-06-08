@@ -85,6 +85,8 @@ T = {
         'test': '[ test & carica archivi ]', 'export': '[ ▶ EXPORT ]',
         'analyze': '[ analizza ]', 'benchmark': '[ benchmark ]',
         'scantmp': '[ scan .tmp ]', 'failed': '[ lista falliti ]',
+        'doctor': '[ doctor ]', 'reconcile': '[ riconcilia ]',
+        'retry': '[ ↻ ritenta falliti ]',
         'stop': '[ ■ STOP ]', 'ready': 'Pronto.',
         'waiting': "In attesa di un'operazione…", 'lang': 'Lingua',
         'months_abbr': ['Gen', 'Feb', 'Mar', 'Apr', 'Mag', 'Giu',
@@ -108,6 +110,8 @@ T = {
         'test': '[ test & load archives ]', 'export': '[ ▶ EXPORT ]',
         'analyze': '[ analyze ]', 'benchmark': '[ benchmark ]',
         'scantmp': '[ scan .tmp ]', 'failed': '[ failed list ]',
+        'doctor': '[ doctor ]', 'reconcile': '[ reconcile ]',
+        'retry': '[ ↻ retry failed ]',
         'stop': '[ ■ STOP ]', 'ready': 'Ready.',
         'waiting': 'Waiting for an operation…', 'lang': 'Language',
         'months_abbr': ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
@@ -132,6 +136,8 @@ T = {
         'test': '[ probar y cargar archivos ]', 'export': '[ ▶ EXPORTAR ]',
         'analyze': '[ analizar ]', 'benchmark': '[ benchmark ]',
         'scantmp': '[ scan .tmp ]', 'failed': '[ lista fallidos ]',
+        'doctor': '[ doctor ]', 'reconcile': '[ reconciliar ]',
+        'retry': '[ ↻ reintentar ]',
         'stop': '[ ■ STOP ]', 'ready': 'Listo.',
         'waiting': 'Esperando una operación…', 'lang': 'Idioma',
         'months_abbr': ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun',
@@ -156,6 +162,8 @@ T = {
         'test': '[ tester & charger archives ]', 'export': '[ ▶ EXPORT ]',
         'analyze': '[ analyser ]', 'benchmark': '[ benchmark ]',
         'scantmp': '[ scan .tmp ]', 'failed': '[ liste échecs ]',
+        'doctor': '[ doctor ]', 'reconcile': '[ réconcilier ]',
+        'retry': '[ ↻ réessayer ]',
         'stop': '[ ■ STOP ]', 'ready': 'Prêt.',
         'waiting': 'En attente d’une opération…', 'lang': 'Langue',
         'months_abbr': ['Jan', 'Fév', 'Mar', 'Avr', 'Mai', 'Jun',
@@ -1011,7 +1019,10 @@ class MailStoreGUI:
         for text, cmd in ((self.t('analyze'), self.on_analyze),
                           (self.t('benchmark'), self.on_benchmark),
                           (self.t('scantmp'), self.on_scan_tmp),
-                          (self.t('failed'), self.on_list_failed)):
+                          (self.t('failed'), self.on_list_failed),
+                          (self.t('doctor'), self.on_doctor),
+                          (self.t('reconcile'), self.on_reconcile),
+                          (self.t('retry'), self.on_retry_failed)):
             b = RBtn(act, text, cmd, parent_bg=BG, font=self.font_btn)
             b.pack(side='left', padx=4)
             self.action_buttons.append(b)
@@ -1380,6 +1391,52 @@ class MailStoreGUI:
             return
         argv += ['--list-failed']
         self._launch(argv, label='list-failed')
+
+    def on_doctor(self) -> None:
+        # Health-check struttura: serve il server (credenziali). Se sono
+        # selezionati archivi, il doctor si limita a quelli; altrimenti tutti.
+        argv, err = self._common_argv(require_archives=False, require_output=True)
+        if err:
+            messagebox.showerror('Doctor', err)
+            return
+        argv += ['--doctor']
+        for a in self._selected_archives():
+            argv += ['--archive', a]
+        self._launch(argv, label='doctor')
+
+    def on_reconcile(self) -> None:
+        # Riconciliazione SOLO da state.db: niente server, basta l'output.
+        out = self.var_output.get().strip()
+        if not out:
+            messagebox.showerror('Riconcilia', 'Scegli una cartella di output.')
+            return
+        argv = [sys.executable, str(CLI_SCRIPT), '--no-interactive',
+                '--reconcile', '--output', out]
+        self._launch(argv, label='reconcile')
+
+    def on_retry_failed(self) -> None:
+        argv, err = self._common_argv(require_archives=False, require_output=True)
+        if err:
+            messagebox.showerror('Ritenta falliti', err)
+            return
+        choice = messagebox.askyesnocancel(
+            'Ritenta falliti',
+            'Ri-scarica i messaggi in failed_messages (rete, IncompleteRead, '
+            '500 temporanei sono recuperabili).\n\n'
+            'Saltare i fallimenti PERMANENTI (messaggi corrotti lato MailStore: '
+            'ritentarli è inutile)?\n\n'
+            '• Sì = salta i permanenti (consigliato)\n'
+            '• No = ritenta tutti\n'
+            '• Annulla = non fare nulla')
+        if choice is None:
+            return
+        argv += ['--retry-failed']
+        if choice:
+            argv += ['--retry-skip-permanent']
+        # Se sono selezionati archivi, ritenta solo quelli; altrimenti tutti.
+        for a in self._selected_archives():
+            argv += ['--archive', a]
+        self._launch(argv, label='retry-failed')
 
     # ----- subprocess lifecycle --------------------------------------------
 
