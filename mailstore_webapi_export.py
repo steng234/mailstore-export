@@ -1126,13 +1126,13 @@ def export_folder(client: WebClient, archive: str, folder_path: str,
     already = state.get_exported_keys_for_folder(archive, api_folder)
     # Set globale di gid/mid da saltare (popolato da main via cfg)
     excluded: set[str] = cfg.get('excluded_keys') or set()
-    # total already counted up front when known_total -> don't add it again
-    if cfg.get('known_total'):
-        progress.inc(skipped_msgs=len(already), skip_resume=len(already),
-                     done_msgs=len(already))
-    else:
-        progress.inc(total_msgs=total, skipped_msgs=len(already),
-                     skip_resume=len(already), done_msgs=len(already))
+    # NB: i messaggi GIÀ esportati (resume) NON vengono accreditati in blocco
+    # qui. `already` contiene TUTTO lo storico della cartella, anche fuori dal
+    # filtro data: accreditarlo tutto come 'done' gonfiava la barra oltre il
+    # 100% (total è solo la finestra). Vengono invece contati uno per uno
+    # DURANTE la scansione, solo se ricadono nella finestra (vedi sotto).
+    if not cfg.get('known_total'):
+        progress.inc(total_msgs=total)
 
     # Determina parallelismo
     workers = cfg.get('workers', 16)
@@ -1142,6 +1142,7 @@ def export_folder(client: WebClient, archive: str, folder_path: str,
     pending: list = []  # list[Future]
     # Contatori PER-CARTELLA (per il log di riepilogo finale).
     f_dispatched = 0    # download avviati per questa cartella
+    f_resume = 0        # già esportati e dentro la finestra (resume)
     f_skip_excluded = 0
     f_skip_filter = 0
     f_failed = 0
@@ -1265,22 +1266,28 @@ def export_folder(client: WebClient, archive: str, folder_path: str,
                     if gid is None or mid is None:
                         continue
                     key = f'{gid}/{mid}'
-                    if key in already:
-                        continue
-                    if excluded and key in excluded:
-                        # gid/mid in skip-list (--exclude-failed/--exclude-from)
-                        progress.inc(skipped_msgs=1, skip_excluded=1)
-                        f_skip_excluded += 1
-                        continue
                     # Filtro mese per-item SOLO nel caso "soli mesi" (non
                     # esprimibile a intervalli). Negli span da date_intervals i
                     # messaggi sono già tutti nel periodo: nessuna analisi.
+                    # Va PRIMA del resume, così non contiamo come 'done' i
+                    # già-esportati che non rientrano nel filtro.
                     if item_month_filter:
                         _yr, mo = _item_year_month(item)
                         if mo not in months:
                             progress.inc(skip_filter=1)
                             f_skip_filter += 1
                             continue
+                    if key in already:
+                        # Già esportato in un run precedente e DENTRO la finestra:
+                        # conta come fatto (riempie la barra) ma non riscaricare.
+                        progress.inc(done_msgs=1, skipped_msgs=1, skip_resume=1)
+                        f_resume += 1
+                        continue
+                    if excluded and key in excluded:
+                        # gid/mid in skip-list (--exclude-failed/--exclude-from)
+                        progress.inc(skipped_msgs=1, skip_excluded=1)
+                        f_skip_excluded += 1
+                        continue
 
                     f_dispatched += 1
                     if use_pool:
@@ -1321,7 +1328,7 @@ def export_folder(client: WebClient, archive: str, folder_path: str,
     f_ok = max(0, f_dispatched - f_failed)
     logger.info('[FOLDER] %r COMPLETATA: scaricati %d, già presenti %d, '
                 'esclusi-filtro %d, falliti %d  (nel periodo: %d / cartella: %d)',
-                api_folder, f_ok, len(already), f_skip_filter, f_failed,
+                api_folder, f_ok, f_resume, f_skip_filter, f_failed,
                 total, total_all)
 
 
