@@ -531,5 +531,84 @@ class TestFormatOSError(unittest.TestCase):
         self.assertIn('accesso negato', s)
 
 
+# ============================================================
+# _build_date_intervals (filtro -> intervalli di data)
+# ============================================================
+
+class TestBuildDateIntervals(unittest.TestCase):
+    def test_no_filter_is_none(self):
+        self.assertIsNone(wex._build_date_intervals(set(), set()))
+
+    def test_months_only_is_none(self):
+        # soli mesi (senza anno) non sono esprimibili a intervalli
+        self.assertIsNone(wex._build_date_intervals(set(), {3, 4}))
+
+    def test_single_year(self):
+        iv = wex._build_date_intervals({2025}, set())
+        self.assertEqual(iv, [(datetime(2025, 1, 1),
+                               datetime(2025, 12, 31, 23, 59, 59))])
+
+    def test_adjacent_years_merged(self):
+        iv = wex._build_date_intervals({2024, 2025}, set())
+        self.assertEqual(iv, [(datetime(2024, 1, 1),
+                               datetime(2025, 12, 31, 23, 59, 59))])
+
+    def test_non_contiguous_years_two_intervals_desc(self):
+        iv = wex._build_date_intervals({2023, 2025}, set())
+        # ordinati per hi DESC: prima 2025, poi 2023
+        self.assertEqual(iv[0][0], datetime(2025, 1, 1))
+        self.assertEqual(iv[1][0], datetime(2023, 1, 1))
+        self.assertEqual(len(iv), 2)
+
+    def test_year_month(self):
+        iv = wex._build_date_intervals({2025}, {2})
+        self.assertEqual(iv, [(datetime(2025, 2, 1),
+                               datetime(2025, 2, 28, 23, 59, 59))])
+
+    def test_year_december_month_boundary(self):
+        iv = wex._build_date_intervals({2025}, {12})
+        self.assertEqual(iv, [(datetime(2025, 12, 1),
+                               datetime(2025, 12, 31, 23, 59, 59))])
+
+    def test_explicit_range_takes_precedence(self):
+        df = datetime(2025, 3, 10)
+        dt = datetime(2025, 3, 10, 23, 59, 59)
+        iv = wex._build_date_intervals({2025}, {1}, df, dt)
+        self.assertEqual(iv, [(df, dt)])
+
+
+# ============================================================
+# _span_in_sorted (finestra indici per intervallo, su lista desc)
+# ============================================================
+
+class TestSpanInSorted(unittest.TestCase):
+    @staticmethod
+    def _dt_at(dts_desc):
+        return lambda i: dts_desc[i] if 0 <= i < len(dts_desc) else None
+
+    def test_window_in_middle(self):
+        # desc; cerchiamo [2025-01-01, 2025-12-31]
+        dts = [datetime(2026, 1, 5), datetime(2025, 12, 1),
+               datetime(2025, 6, 1), datetime(2025, 1, 2),
+               datetime(2024, 11, 1)]
+        s, e = wex._span_in_sorted(len(dts), datetime(2025, 1, 1),
+                                   datetime(2025, 12, 31, 23, 59, 59),
+                                   self._dt_at(dts))
+        self.assertEqual((s, e), (1, 4))  # indici 1,2,3 sono 2025
+
+    def test_no_match(self):
+        dts = [datetime(2026, 1, 1), datetime(2024, 1, 1)]
+        s, e = wex._span_in_sorted(len(dts), datetime(2025, 1, 1),
+                                   datetime(2025, 12, 31), self._dt_at(dts))
+        self.assertEqual(s, e)
+
+    def test_undated_tail_excluded(self):
+        dts = [datetime(2025, 5, 1), datetime(2025, 1, 1), None, None]
+        s, e = wex._span_in_sorted(len(dts), datetime(2025, 1, 1),
+                                   datetime(2025, 12, 31, 23, 59, 59),
+                                   self._dt_at(dts))
+        self.assertEqual((s, e), (0, 2))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

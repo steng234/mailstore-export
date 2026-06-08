@@ -78,7 +78,11 @@ T = {
         'countfirst': 'Conta prima (barra precisa)',
         'inc': 'Include cartelle (regex)', 'exc': 'Escludi cartelle (regex)',
         'years': 'Anni', 'months': 'Mesi', 'all_years': 'Tutti gli anni',
-        'all_months': 'Tutti i mesi', 'sel_all': '[ sel. tutti ]',
+        'all_months': 'Tutti i mesi',
+        'date_from': 'Data da', 'date_to': 'Data a',
+        'date_hint': 'Range esatto YYYY-MM-DD (anche un solo giorno). '
+                     'Ha precedenza su anni/mesi; scarica diretto la finestra.',
+        'sel_all': '[ sel. tutti ]',
         'desel_all': '[ desel. tutti ]', 'search': 'cerca',
         'arc_hint': '(premi "Test & carica archivi" per popolare)',
         'no_match': 'nessun archivio corrisponde', 'load_env': '[ carica .env ]',
@@ -103,7 +107,11 @@ T = {
         'countfirst': 'Count first (accurate bar)',
         'inc': 'Include folders (regex)', 'exc': 'Exclude folders (regex)',
         'years': 'Years', 'months': 'Months', 'all_years': 'All years',
-        'all_months': 'All months', 'sel_all': '[ select all ]',
+        'all_months': 'All months',
+        'date_from': 'Date from', 'date_to': 'Date to',
+        'date_hint': 'Exact range YYYY-MM-DD (even a single day). Takes '
+                     'precedence over years/months; fetches the window directly.',
+        'sel_all': '[ select all ]',
         'desel_all': '[ deselect all ]', 'search': 'search',
         'arc_hint': '(press "test & load archives" to populate)',
         'no_match': 'no archive matches', 'load_env': '[ load .env ]',
@@ -129,7 +137,11 @@ T = {
         'countfirst': 'Contar primero (barra precisa)',
         'inc': 'Incluir carpetas (regex)', 'exc': 'Excluir carpetas (regex)',
         'years': 'Años', 'months': 'Meses', 'all_years': 'Todos los años',
-        'all_months': 'Todos los meses', 'sel_all': '[ sel. todo ]',
+        'all_months': 'Todos los meses',
+        'date_from': 'Fecha desde', 'date_to': 'Fecha hasta',
+        'date_hint': 'Rango exacto YYYY-MM-DD (incluso un solo día). Tiene '
+                     'prioridad sobre años/meses; baja la ventana directamente.',
+        'sel_all': '[ sel. todo ]',
         'desel_all': '[ desel. todo ]', 'search': 'buscar',
         'arc_hint': '(pulsa "probar y cargar archivos" para poblar)',
         'no_match': 'ningún archivo coincide', 'load_env': '[ cargar .env ]',
@@ -155,7 +167,11 @@ T = {
         'countfirst': 'Compter d’abord (barre précise)',
         'inc': 'Inclure dossiers (regex)', 'exc': 'Exclure dossiers (regex)',
         'years': 'Années', 'months': 'Mois', 'all_years': 'Toutes les années',
-        'all_months': 'Tous les mois', 'sel_all': '[ tout sél. ]',
+        'all_months': 'Tous les mois',
+        'date_from': 'Date de', 'date_to': 'Date à',
+        'date_hint': 'Plage exacte YYYY-MM-DD (même un seul jour). Prioritaire '
+                     'sur années/mois ; télécharge directement la fenêtre.',
+        'sel_all': '[ tout sél. ]',
         'desel_all': '[ tout désél. ]', 'search': 'rechercher',
         'arc_hint': '(cliquez "tester & charger archives" pour remplir)',
         'no_match': 'aucune archive ne correspond', 'load_env': '[ charger .env ]',
@@ -745,6 +761,8 @@ class MailStoreGUI:
         self._years = list(range(YEAR_MAX, YEAR_MIN - 1, -1))  # descending
         self.var_include = tk.StringVar()
         self.var_exclude = tk.StringVar()
+        self.var_date_from = tk.StringVar()
+        self.var_date_to = tk.StringVar()
         self.var_status = tk.StringVar(value=self.t('ready'))
         self.var_prog_text = tk.StringVar(value=self.t('waiting'))
 
@@ -969,6 +987,20 @@ class MailStoreGUI:
         self.month_dd.grid(row=1, column=3, sticky='w', **pad)
         self.month_label.grid_remove()
         self.month_dd.grid_remove()  # shown only when exactly one year is picked
+
+        # Filtro per RANGE di data esatto (YYYY-MM-DD). Più stringente di
+        # anno/mese: scarica DIRETTAMENTE la finestra. Ha precedenza su anno/mese.
+        ttk.Label(pb, text=self.t('date_from'), style='CardMuted.TLabel').grid(
+            row=2, column=0, sticky='w', **pad)
+        REntry(pb, self.var_date_from, width=130, font=self.font_base).grid(
+            row=2, column=1, sticky='w', **pad)
+        ttk.Label(pb, text=self.t('date_to'), style='CardMuted.TLabel').grid(
+            row=2, column=2, sticky='w', padx=(24, 8), pady=6)
+        REntry(pb, self.var_date_to, width=130, font=self.font_base).grid(
+            row=2, column=3, sticky='w', **pad)
+        ttk.Label(pb, text=self.t('date_hint'),
+                  style='CardMuted.TLabel').grid(
+            row=3, column=0, columnspan=4, sticky='w', padx=8, pady=(0, 6))
 
         # Archives card
         arc = Card(outer, self.t('card_arc'), title_font=self.font_h2)
@@ -1329,6 +1361,16 @@ class MailStoreGUI:
             months = self._months()
             for name in self.month_dd.selected():
                 argv += ['--month', str(months.index(name) + 1)]
+        # Range di data esatto (YYYY-MM-DD): ha precedenza su anno/mese lato CLI.
+        df = self.var_date_from.get().strip()
+        dt_ = self.var_date_to.get().strip()
+        for lbl, val in ((self.t('date_from'), df), (self.t('date_to'), dt_)):
+            if val and not re.match(r'^\d{4}-\d{2}-\d{2}$', val):
+                return None, f'{lbl}: usa il formato YYYY-MM-DD (es. 2025-01-15).'
+        if df:
+            argv += ['--date-from', df]
+        if dt_:
+            argv += ['--date-to', dt_]
         for patt in self.var_include.get().strip().splitlines():
             if patt.strip():
                 argv += ['--include-folder', patt.strip()]

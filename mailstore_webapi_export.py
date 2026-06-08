@@ -41,7 +41,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Riusa utility dallo script IMAP (sanitize, build_filename, ecc.)
@@ -764,6 +764,101 @@ def safe_local_path_for(archive: str, folder_path: str,
     return output_root.joinpath(*safe) if safe else output_root
 
 
+def _item_dt(item: dict):
+    """datetime NAIVE (UTC) dalla data ISO di un item di ricerca, o None."""
+    ds = item.get('date')
+    if not ds:
+        return None
+    try:
+        return datetime.fromisoformat(ds.replace('Z', '+00:00')).replace(
+            tzinfo=None)
+    except (ValueError, AttributeError):
+        return None
+
+
+def _build_date_intervals(years: set, months: set,
+                          date_from=None, date_to=None):
+    """Traduce il filtro (anni/mesi o range esplicito) in una lista di intervalli
+    di data (lo, hi) datetime INCLUSIVI, ordinati per `hi` DECRESCENTE (per
+    combaciare con i risultati d-desc) e fusi se adiacenti/sovrapposti.
+
+    Ritorna None se il filtro NON è esprimibile come intervalli (soli mesi senza
+    anno: ricorrono ogni anno) o se non c'è filtro: in quei casi si usa il
+    vecchio percorso per-item. `date_from`/`date_to` (se presenti) hanno la
+    precedenza su anni/mesi.
+    """
+    years = years or set()
+    months = months or set()
+    intervals = []
+    if date_from or date_to:
+        lo = date_from or datetime(1, 1, 1)
+        hi = date_to or datetime(9999, 12, 31, 23, 59, 59)
+        intervals.append((lo, hi))
+    elif years and months:
+        for y in sorted(years):
+            for m in sorted(months):
+                lo = datetime(y, m, 1)
+                nxt = datetime(y + 1, 1, 1) if m == 12 else datetime(y, m + 1, 1)
+                intervals.append((lo, nxt - timedelta(seconds=1)))
+    elif years:
+        for y in sorted(years):
+            intervals.append((datetime(y, 1, 1),
+                              datetime(y, 12, 31, 23, 59, 59)))
+    else:
+        return None  # soli mesi o nessun filtro -> non esprimibile a intervalli
+
+    if not intervals:
+        return None
+    intervals.sort()  # per lo ascendente
+    merged = [intervals[0]]
+    for lo, hi in intervals[1:]:
+        plo, phi = merged[-1]
+        if lo <= phi + timedelta(seconds=1):  # adiacenti o sovrapposti
+            merged[-1] = (plo, max(phi, hi))
+        else:
+            merged.append((lo, hi))
+    merged.sort(key=lambda iv: iv[1], reverse=True)  # hi desc, come lo scan
+    return merged
+
+
+def _span_in_sorted(total: int, lo, hi, dt_at) -> tuple:
+    """Estremi [start, end) degli indici i cui messaggi hanno lo <= data <= hi,
+    su una search ordinata per data DECRESCENTE. dt_at(i) -> datetime|None
+    (None = "più piccolo di tutto": le mail senza data scivolano in coda).
+
+    Due ricerche binarie: start = primo i con data <= hi (i più nuovi di hi sono
+    esclusi), end = primo i con data < lo (i più vecchi del range). O(log total).
+    """
+    if total <= 0:
+        return 0, 0
+
+    def first_le(threshold) -> int:        # primo i con dt(i) <= threshold
+        a, b = 0, total
+        while a < b:
+            m = (a + b) // 2
+            d = dt_at(m)
+            if d is not None and d > threshold:
+                a = m + 1
+            else:
+                b = m
+        return a
+
+    def first_lt(threshold) -> int:        # primo i con dt(i) <  threshold
+        a, b = 0, total
+        while a < b:
+            m = (a + b) // 2
+            d = dt_at(m)
+            if d is not None and d >= threshold:
+                a = m + 1
+            else:
+                b = m
+        return a
+
+    start = first_le(hi)
+    end = first_lt(lo)
+    return (start, end) if end > start else (start, start)
+
+
 def _count_years_in_sorted(total: int, years: set, year_at) -> tuple:
     """Conta i messaggi il cui anno è in `years`, data una search ordinata per
     data DECRESCENTE (d-desc) di dimensione `total` e una callable
@@ -804,68 +899,72 @@ def _count_years_in_sorted(total: int, years: set, year_at) -> tuple:
 
 def folder_filtered_count(client: WebClient, search_id: str, total: int,
                           years: set, months: set,
-                          logger: logging.Logger) -> int:
-    """Conteggio di una cartella RIFERITO al filtro anno/mese, calcolato lato
-    client sui risultati ordinati per data (la search di MailStore non accetta
-    filtri data lato server: testato, qualunque campo data dà HTTP 400).
+                          logger: logging.Logger,
+                          date_intervals=None) -> int:
+    """Conteggio di una cartella RIFERITO al filtro data, calcolato lato client
+    sui risultati ordinati per data (la search di MailStore non accetta filtri
+    data lato server: testato, qualunque campo data dà HTTP 400).
 
-    Senza filtri ritorna `total`. Con solo anni usa la ricerca binaria (poche
-    sonde). Con i mesi raffina paginando SOLO dentro i blocchi degli anni."""
-    if not years and not months:
+    Anni / anno+mese / range espliciti diventano intervalli e si contano
+    ESATTAMENTE sommando le finestre [start,end) via ricerca binaria (poche
+    sonde, nessuna scansione completa). Soli mesi (non esprimibili a intervalli)
+    si contano paginando per-item. Senza filtri ritorna `total`."""
+    if date_intervals is None:
+        date_intervals = _build_date_intervals(years, months)
+    if not date_intervals and not months:
         return total
     if total <= 0:
         return 0
 
     _cache: dict = {}
 
-    def year_at(i: int):
+    def dt_at(i: int):
         if i in _cache:
             return _cache[i]
         try:
             res = client.get_search_results(search_id, i, 1)
             items = res.get('searchResultItems') or []
-            y = _item_year_month(items[0])[0] if items else None
+            d = _item_dt(items[0]) if items else None
         except Exception:
-            y = None
-        _cache[i] = y
-        return y
+            d = None
+        _cache[i] = d
+        return d
 
-    def _count_months_in_span(start: int, end: int) -> int:
+    if date_intervals:
         n = 0
-        i = start
-        while i < end:
-            page = min(300, end - i)
-            try:
-                res = client.get_search_results(search_id, i, page)
-            except Exception:
-                break
-            items = res.get('searchResultItems') or []
-            if not items:
-                break
-            for it in items:
-                yr, mo = _item_year_month(it)
-                if (not years or yr in years) and (not months or mo in months):
-                    n += 1
-            i += len(items)
+        for lo, hi in date_intervals:
+            s, e = _span_in_sorted(total, lo, hi, dt_at)
+            n += max(0, e - s)
         return n
 
-    if years:
-        count, spans = _count_years_in_sorted(total, years, year_at)
-        if not months:
-            return count
-        return sum(_count_months_in_span(s, e) for (_y, s, e) in spans)
-
-    # Solo mesi (senza anno): caso raro. Pagina tutto contando i match.
-    return _count_months_in_span(0, total)
+    # Soli mesi (senza anno): non esprimibile a intervalli. Pagina contando.
+    n = 0
+    i = 0
+    while i < total:
+        page = min(300, total - i)
+        try:
+            res = client.get_search_results(search_id, i, page)
+        except Exception:
+            break
+        items = res.get('searchResultItems') or []
+        if not items:
+            break
+        for it in items:
+            _yr, mo = _item_year_month(it)
+            if mo in months:
+                n += 1
+        i += len(items)
+    return n
 
 
 def count_folder(client: WebClient, archive: str, folder_path: str,
                  logger: logging.Logger,
-                 years: set = None, months: set = None) -> int:
+                 years: set = None, months: set = None,
+                 date_intervals=None) -> int:
     """Message count of one folder (creates a search, reads its count).
 
-    Se `years`/`months` sono passati, il conteggio è riferito a quel filtro
-    (lato client sui risultati ordinati per data)."""
+    Se `years`/`months`/`date_intervals` sono passati, il conteggio è riferito a
+    quel filtro (lato client sui risultati ordinati per data)."""
     api_folder = f'{archive}/{folder_path}' if folder_path else archive
     years = years or set()
     months = months or set()
@@ -875,7 +974,7 @@ def count_folder(client: WebClient, archive: str, folder_path: str,
             client.wait_search_done(sid)
             total = client.get_search_count(sid)
             return folder_filtered_count(client, sid, total, years, months,
-                                         logger)
+                                         logger, date_intervals=date_intervals)
         except AuthExpired:
             raise
         except ApiError as e:
@@ -894,12 +993,13 @@ def precount(client: WebClient, archives: list[str], workers: int,
              stop_event: threading.Event, logger: logging.Logger,
              progress: Progress, folder_include: list[re.Pattern],
              folder_exclude: list[re.Pattern],
-             years: set = None, months: set = None) -> int:
+             years: set = None, months: set = None,
+             date_intervals=None) -> int:
     """Count messages to download up front, so the progress bar has a fixed
     total. Enumerates folders, then counts them in parallel (cache-safe cap).
 
-    Se `years`/`months` sono attivi, il conteggio è già RIFERITO al filtro: la
-    barra parte col totale dell'anno, non con quello dell'intera cartella."""
+    Se il filtro data è attivo, il conteggio è già RIFERITO al filtro: la barra
+    parte col totale del periodo, non con quello dell'intera cartella."""
     years = years or set()
     months = months or set()
     folder_list: list[tuple[str, str]] = []
@@ -929,7 +1029,7 @@ def precount(client: WebClient, archives: list[str], workers: int,
     with ThreadPoolExecutor(max_workers=pool_workers,
                             thread_name_prefix='cnt') as pool:
         futs = {pool.submit(count_folder, client, a, f, logger,
-                            years, months): (a, f)
+                            years, months, date_intervals): (a, f)
                 for a, f in folder_list}
         for fut in as_completed(futs):
             if stop_event.is_set():
@@ -968,11 +1068,16 @@ def export_folder(client: WebClient, archive: str, folder_path: str,
 
     years: set[int] = cfg.get('years') or set()
     months: set[int] = cfg.get('months') or set()
+    # Intervalli di data pre-calcolati in main (anni/mesi/range espliciti). None
+    # = filtro non esprimibile a intervalli (soli mesi) o nessun filtro.
+    date_intervals = cfg.get('date_intervals')
+    if date_intervals is None:
+        date_intervals = _build_date_intervals(years, months)
 
     # Crea+polla+count con retry su search expired
     search_id = None
     total_all = 0   # count COMPLETO della cartella -> bound della paginazione
-    total = 0       # count RIFERITO al filtro anno/mese -> barra + DB
+    total = 0       # count RIFERITO al filtro data -> barra + DB
     last_err: Exception | None = None
     for attempt in range(3):
         try:
@@ -985,7 +1090,8 @@ def export_folder(client: WebClient, archive: str, folder_path: str,
             # ordinati per data (la search di MailStore non accetta filtri data
             # lato server). Senza filtri -> total_all.
             total = folder_filtered_count(client, search_id, total_all,
-                                          years, months, logger)
+                                          years, months, logger,
+                                          date_intervals=date_intervals)
             break
         except AuthExpired:
             raise
@@ -1034,10 +1140,15 @@ def export_folder(client: WebClient, archive: str, folder_path: str,
     use_pool = download_pool is not None
 
     pending: list = []  # list[Future]
+    # Contatori PER-CARTELLA (per il log di riepilogo finale).
+    f_dispatched = 0    # download avviati per questa cartella
+    f_skip_excluded = 0
+    f_skip_filter = 0
+    f_failed = 0
 
     def _drain_completed(block: bool = False):
         """Drena le future completate, gestendo eccezioni + propagazione AuthExpired."""
-        nonlocal pending
+        nonlocal pending, f_failed
         still: list = []
         for fut in pending:
             if fut.done() or block:
@@ -1049,13 +1160,14 @@ def export_folder(client: WebClient, archive: str, folder_path: str,
                 except Exception as ex:
                     logger.error(f'Download fallito in {api_folder!r}: {ex}')
                     progress.inc(failed_msgs=1)
+                    f_failed += 1
             else:
                 still.append(fut)
         pending = still
 
     def _drain_one():
         """Aspetta il completamento di almeno una future pendente."""
-        nonlocal pending
+        nonlocal pending, f_failed
         if not pending:
             return
         from concurrent.futures import wait, FIRST_COMPLETED
@@ -1071,99 +1183,131 @@ def export_folder(client: WebClient, archive: str, folder_path: str,
                 except Exception as ex:
                     logger.error(f'Download fallito in {api_folder!r}: {ex}')
                     progress.inc(failed_msgs=1)
+                    f_failed += 1
             else:
                 still.append(fut)
         pending = still
 
-    # Paginazione + dispatch al pool. Il bound è total_all (count completo):
-    # i messaggi che matchano il filtro non sono all'inizio (es. col filtro
-    # 2025 ci possono essere prima quelli del 2026), quindi dobbiamo poter
-    # scorrere oltre. stop_paging tronca prima quando l'anno scende sotto il
-    # minimo selezionato (risultati in ordine data decrescente).
-    start = 0
-    stop_paging = False
-    try:
-        while start < total_all and not stop_event.is_set() and not stop_paging:
-            res = None
-            for attempt in range(3):
-                try:
-                    res = client.get_search_results(search_id, start, page_size)
-                    break
-                except AuthExpired:
-                    raise
-                except ApiError as e:
-                    if _is_cached_search_expired(e) and attempt < 2:
-                        # La search è stata espulsa dalla cache: ricreala
-                        logger.warning(f'Search cache scaduta per {api_folder!r}, '
-                                       f'ricreo (attempt {attempt + 1}/3)')
-                        try:
-                            search_id = client.create_search(folder=api_folder,
-                                                              recursive=False)
-                            client.wait_search_done(search_id)
-                        except Exception as recreate_err:
-                            logger.error(f'Ricreazione search fallita: '
-                                         f'{recreate_err}')
-                            break
-                        continue
-                    logger.error(f'get_search_results({start}) fallito per '
-                                 f'{api_folder!r}: {e}')
-                    break
-            if res is None:
-                break
+    # Intervalli di INDICE da scaricare. Con un filtro data esprimibile a
+    # intervalli (anni / anno+mese / range espliciti) saltiamo DIRETTAMENTE alle
+    # finestre via ricerca binaria sui risultati ordinati per data: scarichiamo
+    # SOLO quel blocco, senza scorrere/analizzare i messaggi fuori periodo.
+    # Negli altri casi (nessun filtro, o soli mesi) si scorre tutta la cartella.
+    item_month_filter = False
+    if date_intervals:
+        _dtcache: dict = {}
 
-            items = res.get('searchResultItems') or []
-            if not items:
-                break
+        def _dt_at(i: int):
+            if i in _dtcache:
+                return _dtcache[i]
+            try:
+                r = client.get_search_results(search_id, i, 1)
+                its = r.get('searchResultItems') or []
+                d = _item_dt(its[0]) if its else None
+            except Exception:
+                d = None
+            _dtcache[i] = d
+            return d
 
-            for item in items:
-                if stop_event.is_set():
-                    break
-                gid = item.get('gid')
-                mid = item.get('mid')
-                if gid is None or mid is None:
-                    continue
-                key = f'{gid}/{mid}'
-                if key in already:
-                    continue
-                if excluded and key in excluded:
-                    # gid/mid in skip-list (--exclude-failed o --exclude-from)
-                    progress.inc(skipped_msgs=1, skip_excluded=1)
-                    continue
-                # Year/month filter: applied BEFORE download using the search
-                # result date. `total` è già riferito al filtro, quindi gli
-                # scartati si contano come skip_filter SENZA decrementare il
-                # totale (a differenza di prima, quando total era il completo).
-                if years or months:
-                    yr, mo = _item_year_month(item)
-                    # Early-stop: ordine data DECRESCENTE -> sotto il minimo anno
-                    # selezionato non ci sono più match. Tronca la paginazione.
-                    if years and yr is not None and yr < min(years):
-                        stop_paging = True
-                        break
-                    if (years and yr not in years) or (months and mo not in months):
-                        progress.inc(skip_filter=1)
-                        continue
+        scan_ranges = []
+        for lo, hi in date_intervals:
+            s, e = _span_in_sorted(total_all, lo, hi, _dt_at)
+            if e > s:
+                scan_ranges.append((s, e))
+        logger.info('[FOLDER] %r: filtro data -> %d finestra/e su %d totali '
+                    '(scarico diretto, nessuna scansione completa)',
+                    api_folder, len(scan_ranges), total_all)
+    else:
+        scan_ranges = [(0, total_all)]
+        item_month_filter = bool(months)  # soli mesi: filtro per-item
 
-                if use_pool:
-                    # Backpressure: se troppi in volo, aspetta che si liberi
-                    while len(pending) >= max_inflight and not stop_event.is_set():
-                        _drain_one()
-                    fut = download_pool.submit(
-                        download_and_save, client, item, archive,
-                        output_root, state, progress, cfg, logger)
-                    pending.append(fut)
-                else:
-                    # Modalità sequenziale (fallback)
+    def _fetch_page(idx: int, count: int):
+        """get_search_results con retry su search-cache scaduta (ricrea)."""
+        nonlocal search_id
+        for attempt in range(3):
+            try:
+                return client.get_search_results(search_id, idx, count)
+            except AuthExpired:
+                raise
+            except ApiError as e:
+                if _is_cached_search_expired(e) and attempt < 2:
+                    logger.warning(f'Search cache scaduta per {api_folder!r}, '
+                                   f'ricreo (attempt {attempt + 1}/3)')
                     try:
-                        download_and_save(client, item, archive, output_root,
-                                          state, progress, cfg, logger)
-                    except AuthExpired:
-                        raise
-                    except Exception as ex:
-                        logger.error(f'Download {key} fallito: {ex}')
-                        progress.inc(failed_msgs=1)
+                        search_id = client.create_search(folder=api_folder,
+                                                          recursive=False)
+                        client.wait_search_done(search_id)
+                    except Exception as recreate_err:
+                        logger.error(f'Ricreazione search fallita: {recreate_err}')
+                        return None
+                    continue
+                logger.error(f'get_search_results({idx}) fallito per '
+                             f'{api_folder!r}: {e}')
+                return None
+        return None
 
-            start += page_size
+    try:
+        for r_start, r_end in scan_ranges:
+            start = r_start
+            while start < r_end and not stop_event.is_set():
+                res = _fetch_page(start, min(page_size, r_end - start))
+                if res is None:
+                    break
+                items = res.get('searchResultItems') or []
+                if not items:
+                    break
+
+                for item in items:
+                    if stop_event.is_set():
+                        break
+                    gid = item.get('gid')
+                    mid = item.get('mid')
+                    if gid is None or mid is None:
+                        continue
+                    key = f'{gid}/{mid}'
+                    if key in already:
+                        continue
+                    if excluded and key in excluded:
+                        # gid/mid in skip-list (--exclude-failed/--exclude-from)
+                        progress.inc(skipped_msgs=1, skip_excluded=1)
+                        f_skip_excluded += 1
+                        continue
+                    # Filtro mese per-item SOLO nel caso "soli mesi" (non
+                    # esprimibile a intervalli). Negli span da date_intervals i
+                    # messaggi sono già tutti nel periodo: nessuna analisi.
+                    if item_month_filter:
+                        _yr, mo = _item_year_month(item)
+                        if mo not in months:
+                            progress.inc(skip_filter=1)
+                            f_skip_filter += 1
+                            continue
+
+                    f_dispatched += 1
+                    if use_pool:
+                        # Backpressure: se troppi in volo, aspetta che si liberi
+                        while len(pending) >= max_inflight \
+                                and not stop_event.is_set():
+                            _drain_one()
+                        fut = download_pool.submit(
+                            download_and_save, client, item, archive,
+                            output_root, state, progress, cfg, logger)
+                        pending.append(fut)
+                    else:
+                        # Modalità sequenziale (fallback)
+                        try:
+                            download_and_save(client, item, archive,
+                                              output_root, state, progress,
+                                              cfg, logger)
+                        except AuthExpired:
+                            raise
+                        except Exception as ex:
+                            logger.error(f'Download {key} fallito: {ex}')
+                            progress.inc(failed_msgs=1)
+                            f_failed += 1
+
+                start += page_size
+            if stop_event.is_set():
+                break
 
         # Aspetta tutti i pending della cartella prima di passare alla prossima
         if use_pool:
@@ -1174,7 +1318,11 @@ def export_folder(client: WebClient, archive: str, folder_path: str,
             _drain_completed(block=True)
 
     progress.inc(done_folders=1)
-    logger.info(f'Cartella completata: {api_folder!r}')
+    f_ok = max(0, f_dispatched - f_failed)
+    logger.info('[FOLDER] %r COMPLETATA: scaricati %d, già presenti %d, '
+                'esclusi-filtro %d, falliti %d  (nel periodo: %d / cartella: %d)',
+                api_folder, f_ok, len(already), f_skip_filter, f_failed,
+                total, total_all)
 
 
 _TMP_WRITE_BACKOFF = (0.05, 0.1, 0.2, 0.4, 0.8)
@@ -2530,6 +2678,16 @@ def main():
     parser.add_argument('--month', type=int, action='append', default=[],
                         help='Esporta solo le email di questo mese 1-12 '
                              '(ripetibile). Ha senso con un solo --year.')
+    parser.add_argument('--date-from', default=None,
+                        help='Esporta solo email dal giorno indicato (incluso), '
+                             'formato YYYY-MM-DD. Filtro per RANGE di data, più '
+                             'stringente di --year/--month: salta DIRETTAMENTE '
+                             'alla finestra (niente scansione del resto).')
+    parser.add_argument('--date-to', default=None,
+                        help='Esporta solo email fino al giorno indicato '
+                             '(incluso), formato YYYY-MM-DD. Combinabile con '
+                             '--date-from per un intervallo esatto (anche un '
+                             'singolo giorno: --date-from = --date-to).')
     parser.add_argument('--env-file', type=Path, default=None,
                         help='File .env da caricare (default: ./.env)')
     parser.add_argument('-i', '--interactive', action='store_true',
@@ -2935,15 +3093,47 @@ def main():
         logger.info('--exclude-from %s: +%d gid/mid (totale skip-list: %d)',
                     args.exclude_from, len(loaded), len(excluded_keys))
 
+    # Filtro per RANGE di data esplicito (--date-from/--date-to). Ha la
+    # precedenza su --year/--month (vedi _build_date_intervals).
+    date_from = date_to = None
+    if args.date_from or args.date_to:
+        try:
+            if args.date_from:
+                date_from = datetime.strptime(args.date_from, '%Y-%m-%d')
+            if args.date_to:
+                date_to = datetime.strptime(args.date_to, '%Y-%m-%d').replace(
+                    hour=23, minute=59, second=59)
+        except ValueError:
+            print('ERRORE: --date-from/--date-to devono essere in formato '
+                  'YYYY-MM-DD', file=sys.stderr)
+            sys.exit(2)
+        if date_from and date_to and date_from > date_to:
+            print('ERRORE: --date-from è successivo a --date-to', file=sys.stderr)
+            sys.exit(2)
+
     cfg = {'workers': workers, 'dedup_message_id': dedup,
            'split_by_year': split_by_year,
            'years': set(args.year or []),
            'months': set(args.month or []),
+           'date_from': date_from, 'date_to': date_to,
            'excluded_keys': excluded_keys,
            'known_total': bool(args.count_first)}
-    if cfg['years'] or cfg['months']:
-        logger.info('Filtro periodo: anni=%s mesi=%s',
-                    sorted(cfg['years']) or 'tutti', sorted(cfg['months']) or 'tutti')
+    cfg['date_intervals'] = _build_date_intervals(
+        cfg['years'], cfg['months'], date_from, date_to)
+    if cfg['date_intervals']:
+        if date_from or date_to:
+            logger.info('Filtro RANGE data: %s -> %s (scarico diretto per '
+                        'finestra)', date_from or 'inizio', date_to or 'fine')
+            if cfg['years'] or cfg['months']:
+                logger.info('NB: --date-from/--date-to ha la precedenza su '
+                            '--year/--month (ignorati).')
+        else:
+            logger.info('Filtro periodo: anni=%s mesi=%s (scarico diretto per '
+                        'finestra)', sorted(cfg['years']) or 'tutti',
+                        sorted(cfg['months']) or 'tutti')
+    elif cfg['months']:
+        logger.info('Filtro periodo: soli mesi=%s (scansione per-item)',
+                    sorted(cfg['months']))
 
     # Optional pre-count: fixes the progress-bar total before downloading.
     if args.count_first:
@@ -2951,8 +3141,10 @@ def main():
         try:
             grand = precount(client, archives, workers, stop_event, logger,
                              progress, include_re, exclude_re,
-                             years=cfg['years'], months=cfg['months'])
-            label = ' (filtrato per anno/mese)' if (cfg['years'] or cfg['months']) else ''
+                             years=cfg['years'], months=cfg['months'],
+                             date_intervals=cfg['date_intervals'])
+            has_filter = cfg['date_intervals'] or cfg['months']
+            label = ' (filtrato per data)' if has_filter else ''
             print(f'  totale da scaricare{label}: {grand:,} messaggi')
         except AuthExpired:
             print(f'{sym("✗", "X")} Autenticazione fallita.', file=sys.stderr)
