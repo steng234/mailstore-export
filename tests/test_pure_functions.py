@@ -610,5 +610,38 @@ class TestSpanInSorted(unittest.TestCase):
         self.assertEqual((s, e), (0, 2))
 
 
+# ============================================================
+# reset_state_db (backup + rimozione state.db, .eml intatti)
+# ============================================================
+
+class TestResetStateDb(unittest.TestCase):
+    def test_backup_then_remove_keeps_eml(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            sdir = root / '.mailstore_webapi_export'
+            sdir.mkdir()
+            (sdir / 'state.db').write_bytes(b'SQLITEDB')
+            (sdir / 'state.db-wal').write_bytes(b'wal')
+            (sdir / 'state.db-shm').write_bytes(b'shm')
+            eml = root / 'INBOX' / 'msg.eml'
+            eml.parent.mkdir()
+            eml.write_bytes(b'From: x')
+
+            backup = wex.reset_state_db(root)
+
+            self.assertIsNotNone(backup)
+            self.assertTrue(backup.exists())
+            self.assertEqual(backup.read_bytes(), b'SQLITEDB')  # backup fedele
+            self.assertFalse((sdir / 'state.db').exists())       # db rimosso
+            self.assertFalse((sdir / 'state.db-wal').exists())
+            self.assertFalse((sdir / 'state.db-shm').exists())
+            self.assertTrue(eml.exists())                        # .eml intatto
+
+    def test_no_db_returns_none(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / '.mailstore_webapi_export').mkdir()
+            self.assertIsNone(wex.reset_state_db(Path(d)))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

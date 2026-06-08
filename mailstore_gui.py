@@ -90,7 +90,7 @@ T = {
         'analyze': '[ analizza ]', 'benchmark': '[ benchmark ]',
         'scantmp': '[ scan .tmp ]', 'failed': '[ lista falliti ]',
         'doctor': '[ doctor ]', 'reconcile': '[ riconcilia ]',
-        'retry': '[ ↻ ritenta falliti ]',
+        'retry': '[ ↻ ritenta falliti ]', 'reset_state': '[ ⟲ reset state.db ]',
         'stop': '[ ■ STOP ]', 'ready': 'Pronto.',
         'waiting': "In attesa di un'operazione…", 'lang': 'Lingua',
         'months_abbr': ['Gen', 'Feb', 'Mar', 'Apr', 'Mag', 'Giu',
@@ -119,7 +119,7 @@ T = {
         'analyze': '[ analyze ]', 'benchmark': '[ benchmark ]',
         'scantmp': '[ scan .tmp ]', 'failed': '[ failed list ]',
         'doctor': '[ doctor ]', 'reconcile': '[ reconcile ]',
-        'retry': '[ ↻ retry failed ]',
+        'retry': '[ ↻ retry failed ]', 'reset_state': '[ ⟲ reset state.db ]',
         'stop': '[ ■ STOP ]', 'ready': 'Ready.',
         'waiting': 'Waiting for an operation…', 'lang': 'Language',
         'months_abbr': ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
@@ -149,7 +149,7 @@ T = {
         'analyze': '[ analizar ]', 'benchmark': '[ benchmark ]',
         'scantmp': '[ scan .tmp ]', 'failed': '[ lista fallidos ]',
         'doctor': '[ doctor ]', 'reconcile': '[ reconciliar ]',
-        'retry': '[ ↻ reintentar ]',
+        'retry': '[ ↻ reintentar ]', 'reset_state': '[ ⟲ reset state.db ]',
         'stop': '[ ■ STOP ]', 'ready': 'Listo.',
         'waiting': 'Esperando una operación…', 'lang': 'Idioma',
         'months_abbr': ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun',
@@ -179,7 +179,7 @@ T = {
         'analyze': '[ analyser ]', 'benchmark': '[ benchmark ]',
         'scantmp': '[ scan .tmp ]', 'failed': '[ liste échecs ]',
         'doctor': '[ doctor ]', 'reconcile': '[ réconcilier ]',
-        'retry': '[ ↻ réessayer ]',
+        'retry': '[ ↻ réessayer ]', 'reset_state': '[ ⟲ reset state.db ]',
         'stop': '[ ■ STOP ]', 'ready': 'Prêt.',
         'waiting': 'En attente d’une opération…', 'lang': 'Langue',
         'months_abbr': ['Jan', 'Fév', 'Mar', 'Avr', 'Mai', 'Jun',
@@ -1063,6 +1063,12 @@ class MailStoreGUI:
                              font=self.font_btn_b)
         self.btn_stop.pack(side='right')
         self.btn_stop.set_state(False)
+        # Reset state.db: azione a sé (a destra, separata dai diagnostici).
+        # Protetta da conferma forte + backup automatico nell'handler.
+        self.btn_reset = RBtn(act, self.t('reset_state'), self.on_reset_state,
+                              parent_bg=BG, font=self.font_btn)
+        self.btn_reset.pack(side='right', padx=(0, 12))
+        self.action_buttons.append(self.btn_reset)
 
         # Progress
         prog = tk.Frame(outer, bg=BG)
@@ -1479,6 +1485,44 @@ class MailStoreGUI:
         for a in self._selected_archives():
             argv += ['--archive', a]
         self._launch(argv, label='retry-failed')
+
+    def on_reset_state(self) -> None:
+        # Azzera lo state.db (resume/dedup/conteggi/falliti) con backup. È una
+        # operazione locale e istantanea: la facciamo in-process, non via
+        # subprocess. NON tocca i .eml.
+        out = self.var_output.get().strip()
+        if not out:
+            messagebox.showerror('Reset state.db',
+                                 'Scegli una cartella di output.')
+            return
+        if self.proc is not None:
+            messagebox.showwarning('Occupato',
+                                   'Ferma l\'operazione in corso prima del reset.')
+            return
+        db = Path(out) / '.mailstore_webapi_export' / 'state.db'
+        if not db.exists():
+            messagebox.showinfo('Reset state.db',
+                                f'Nessuno state.db trovato in:\n{db.parent}')
+            return
+        if not messagebox.askyesno(
+                'Reset state.db',
+                'Azzerare lo state.db?\n\n'
+                'Verrà fatto un BACKUP automatico (state.db.bak-…), poi '
+                'cancellato lo state.db: resume, dedup, conteggi e lista '
+                'falliti. I file .eml NON vengono toccati.\n\n'
+                '⚠ Un nuovo export ripartirà da ZERO. Se i .eml sono già '
+                'presenti, verranno creati DUPLICATI (_1, _2). Per un restart '
+                'davvero pulito usa una cartella di output nuova/vuota.\n\n'
+                'Procedere?'):
+            return
+        try:
+            from mailstore_webapi_export import reset_state_db
+            backup = reset_state_db(Path(out))
+            self._log_line(f'$ state.db azzerato. Backup: {backup}')
+            messagebox.showinfo('Reset state.db',
+                                f'Fatto.\nBackup salvato in:\n{backup}')
+        except Exception as exc:
+            messagebox.showerror('Reset state.db', f'Errore: {exc}')
 
     # ----- subprocess lifecycle --------------------------------------------
 

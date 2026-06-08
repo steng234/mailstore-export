@@ -30,6 +30,7 @@ import logging
 import os
 import random
 import re
+import shutil
 import signal
 import sqlite3
 import ssl
@@ -1518,6 +1519,31 @@ def _dump_failed_messages(state: WebApiStateDB, json_out: Path | None) -> int:
     return stats['count']
 
 
+def reset_state_db(output_root: Path):
+    """Azzera lo state.db della cartella di output facendo PRIMA un backup.
+
+    Fa una copia timestampata (state.db.bak-YYYYMMDD_HHMMSS) e poi rimuove
+    state.db e i file WAL/SHM associati. NON tocca i .eml già esportati.
+    Ritorna il Path del backup, o None se non c'era nessuno state.db.
+    """
+    state_dir = output_root / '.mailstore_webapi_export'
+    db = state_dir / 'state.db'
+    if not db.exists():
+        return None
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    backup = state_dir / f'state.db.bak-{ts}'
+    shutil.copy2(db, backup)  # backup PRIMA di cancellare (sempre recuperabile)
+    for suffix in ('', '-wal', '-shm'):
+        p = state_dir / f'state.db{suffix}'
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+    return backup
+
+
 def _load_excluded_from_json(path: Path) -> set[str]:
     """Carica un set di api_key "gid/mid" da un JSON nel formato di --list-failed.
 
@@ -2767,6 +2793,11 @@ def main():
                         help='Con --retry-failed, salta i fallimenti permanenti '
                              '(messaggi corrotti lato MailStore: HTTP 500 '
                              '"could not be entirely retrieved").')
+    parser.add_argument('--reset-state', action='store_true',
+                        help='Azzera lo state.db (resume/dedup/failed/conteggi) '
+                             'facendo PRIMA un backup timestampato. NON tocca i '
+                             '.eml. Richiede --output. Un nuovo export ripartirà '
+                             'da zero (possibili duplicati se i .eml ci sono già).')
     args = parser.parse_args()
 
     # Carica .env (CLI args hanno priorità su env)
@@ -2836,6 +2867,24 @@ def main():
             sys.exit(2)
         state = WebApiStateDB(db_path)
         run_reconcile(state, args.reconcile_output)
+        sys.exit(0)
+
+    # --reset-state: azzera lo state.db (con backup). Solo filesystem, no creds.
+    if args.reset_state:
+        if eff_output is None:
+            print('ERROR: --reset-state richiede --output', file=sys.stderr)
+            sys.exit(2)
+        root = eff_output.expanduser().resolve()
+        backup = reset_state_db(root)
+        if backup is None:
+            print(f'Nessuno state.db da azzerare in '
+                  f'{root / ".mailstore_webapi_export"}')
+        else:
+            print(f'{sym("✓", "OK")} state.db azzerato. Backup: {backup}')
+            print('NB: i .eml NON sono stati toccati. Un nuovo export ripartirà '
+                  'da zero; se i .eml ci sono già verranno creati duplicati '
+                  '(_1, _2). Per un restart davvero pulito usa una cartella '
+                  'di output nuova/vuota.')
         sys.exit(0)
 
     has_creds = bool(eff_token) or bool(eff_username)
