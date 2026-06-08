@@ -764,15 +764,118 @@ def safe_local_path_for(archive: str, folder_path: str,
     return output_root.joinpath(*safe) if safe else output_root
 
 
+def _count_years_in_sorted(total: int, years: set, year_at) -> tuple:
+    """Conta i messaggi il cui anno è in `years`, data una search ordinata per
+    data DECRESCENTE (d-desc) di dimensione `total` e una callable
+    year_at(index) -> int|None.
+
+    Sfrutta la monotonia: per ogni anno trova gli estremi del suo blocco con una
+    ricerca binaria — O(len(years) * log total) sonde, niente paginazione piena.
+    Le mail senza data (year None) finiscono in fondo e non rientrano in alcun
+    anno (coerente con il filtro). Ritorna (count, spans) con spans = lista di
+    (year, start, end) intervalli [start, end) per ciascun anno presente.
+    """
+    if total <= 0 or not years:
+        return 0, []
+
+    def first_index_below(threshold: int) -> int:
+        # Primo indice i con year_at(i) < threshold (None == "più piccolo di
+        # tutto": le mail senza data scivolano in coda).
+        lo, hi = 0, total
+        while lo < hi:
+            mid = (lo + hi) // 2
+            y = year_at(mid)
+            if y is not None and y >= threshold:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+    count = 0
+    spans = []
+    for y in sorted(years, reverse=True):
+        start = first_index_below(y + 1)   # primo i con year <= y
+        end = first_index_below(y)         # primo i con year <  y
+        if end > start:
+            count += end - start
+            spans.append((y, start, end))
+    return count, spans
+
+
+def folder_filtered_count(client: WebClient, search_id: str, total: int,
+                          years: set, months: set,
+                          logger: logging.Logger) -> int:
+    """Conteggio di una cartella RIFERITO al filtro anno/mese, calcolato lato
+    client sui risultati ordinati per data (la search di MailStore non accetta
+    filtri data lato server: testato, qualunque campo data dà HTTP 400).
+
+    Senza filtri ritorna `total`. Con solo anni usa la ricerca binaria (poche
+    sonde). Con i mesi raffina paginando SOLO dentro i blocchi degli anni."""
+    if not years and not months:
+        return total
+    if total <= 0:
+        return 0
+
+    _cache: dict = {}
+
+    def year_at(i: int):
+        if i in _cache:
+            return _cache[i]
+        try:
+            res = client.get_search_results(search_id, i, 1)
+            items = res.get('searchResultItems') or []
+            y = _item_year_month(items[0])[0] if items else None
+        except Exception:
+            y = None
+        _cache[i] = y
+        return y
+
+    def _count_months_in_span(start: int, end: int) -> int:
+        n = 0
+        i = start
+        while i < end:
+            page = min(300, end - i)
+            try:
+                res = client.get_search_results(search_id, i, page)
+            except Exception:
+                break
+            items = res.get('searchResultItems') or []
+            if not items:
+                break
+            for it in items:
+                yr, mo = _item_year_month(it)
+                if (not years or yr in years) and (not months or mo in months):
+                    n += 1
+            i += len(items)
+        return n
+
+    if years:
+        count, spans = _count_years_in_sorted(total, years, year_at)
+        if not months:
+            return count
+        return sum(_count_months_in_span(s, e) for (_y, s, e) in spans)
+
+    # Solo mesi (senza anno): caso raro. Pagina tutto contando i match.
+    return _count_months_in_span(0, total)
+
+
 def count_folder(client: WebClient, archive: str, folder_path: str,
-                 logger: logging.Logger) -> int:
-    """Message count of one folder (creates a search, reads its count)."""
+                 logger: logging.Logger,
+                 years: set = None, months: set = None) -> int:
+    """Message count of one folder (creates a search, reads its count).
+
+    Se `years`/`months` sono passati, il conteggio è riferito a quel filtro
+    (lato client sui risultati ordinati per data)."""
     api_folder = f'{archive}/{folder_path}' if folder_path else archive
+    years = years or set()
+    months = months or set()
     for attempt in range(3):
         try:
             sid = client.create_search(folder=api_folder, recursive=False)
             client.wait_search_done(sid)
-            return client.get_search_count(sid)
+            total = client.get_search_count(sid)
+            return folder_filtered_count(client, sid, total, years, months,
+                                         logger)
         except AuthExpired:
             raise
         except ApiError as e:
@@ -790,9 +893,15 @@ def count_folder(client: WebClient, archive: str, folder_path: str,
 def precount(client: WebClient, archives: list[str], workers: int,
              stop_event: threading.Event, logger: logging.Logger,
              progress: Progress, folder_include: list[re.Pattern],
-             folder_exclude: list[re.Pattern]) -> int:
-    """Count ALL messages to download up front, so the progress bar has a fixed
-    total. Enumerates folders, then counts them in parallel (cache-safe cap)."""
+             folder_exclude: list[re.Pattern],
+             years: set = None, months: set = None) -> int:
+    """Count messages to download up front, so the progress bar has a fixed
+    total. Enumerates folders, then counts them in parallel (cache-safe cap).
+
+    Se `years`/`months` sono attivi, il conteggio è già RIFERITO al filtro: la
+    barra parte col totale dell'anno, non con quello dell'intera cartella."""
+    years = years or set()
+    months = months or set()
     folder_list: list[tuple[str, str]] = []
     for archive in archives:
         if stop_event.is_set():
@@ -819,7 +928,8 @@ def precount(client: WebClient, archives: list[str], workers: int,
     pool_workers = max(1, min(workers, 8))  # search cache saturates over ~8
     with ThreadPoolExecutor(max_workers=pool_workers,
                             thread_name_prefix='cnt') as pool:
-        futs = {pool.submit(count_folder, client, a, f, logger): (a, f)
+        futs = {pool.submit(count_folder, client, a, f, logger,
+                            years, months): (a, f)
                 for a, f in folder_list}
         for fut in as_completed(futs):
             if stop_event.is_set():
@@ -856,9 +966,13 @@ def export_folder(client: WebClient, archive: str, folder_path: str,
     progress.update(current_folder=api_folder)
     logger.info(f'Inizio cartella: {api_folder!r}')
 
+    years: set[int] = cfg.get('years') or set()
+    months: set[int] = cfg.get('months') or set()
+
     # Crea+polla+count con retry su search expired
     search_id = None
-    total = 0
+    total_all = 0   # count COMPLETO della cartella -> bound della paginazione
+    total = 0       # count RIFERITO al filtro anno/mese -> barra + DB
     last_err: Exception | None = None
     for attempt in range(3):
         try:
@@ -866,7 +980,12 @@ def export_folder(client: WebClient, archive: str, folder_path: str,
             client.wait_search_done(search_id)
             # Count autoritativo via /results (foundMessageCount dal polling
             # può essere 0 anche con messaggi presenti).
-            total = client.get_search_count(search_id)
+            total_all = client.get_search_count(search_id)
+            # Count riferito al filtro: calcolato lato client sui risultati
+            # ordinati per data (la search di MailStore non accetta filtri data
+            # lato server). Senza filtri -> total_all.
+            total = folder_filtered_count(client, search_id, total_all,
+                                          years, months, logger)
             break
         except AuthExpired:
             raise
@@ -885,19 +1004,22 @@ def export_folder(client: WebClient, archive: str, folder_path: str,
         logger.error(f'Search create/wait fallita per {api_folder!r}: {last_err}')
         return
 
-    # Salva il count nella DB per tracciabilità
+    # folder_counts registra il count RIFERITO al filtro: così --reconcile
+    # confronta mele con mele (atteso-filtrato vs esportato).
     state.record_folder_count(archive, api_folder, total)
 
     if total == 0:
-        logger.info(f'Cartella vuota: {api_folder!r}')
+        if total_all:
+            logger.info(f'Nessun messaggio nel filtro anno/mese: {api_folder!r} '
+                        f'({total_all} totali in cartella)')
+        else:
+            logger.info(f'Cartella vuota: {api_folder!r}')
         progress.inc(done_folders=1)
         return
 
     already = state.get_exported_keys_for_folder(archive, api_folder)
     # Set globale di gid/mid da saltare (popolato da main via cfg)
     excluded: set[str] = cfg.get('excluded_keys') or set()
-    years: set[int] = cfg.get('years') or set()
-    months: set[int] = cfg.get('months') or set()
     # total already counted up front when known_total -> don't add it again
     if cfg.get('known_total'):
         progress.inc(skipped_msgs=len(already), skip_resume=len(already),
@@ -953,10 +1075,15 @@ def export_folder(client: WebClient, archive: str, folder_path: str,
                 still.append(fut)
         pending = still
 
-    # Paginazione + dispatch al pool
+    # Paginazione + dispatch al pool. Il bound è total_all (count completo):
+    # i messaggi che matchano il filtro non sono all'inizio (es. col filtro
+    # 2025 ci possono essere prima quelli del 2026), quindi dobbiamo poter
+    # scorrere oltre. stop_paging tronca prima quando l'anno scende sotto il
+    # minimo selezionato (risultati in ordine data decrescente).
     start = 0
+    stop_paging = False
     try:
-        while start < total and not stop_event.is_set():
+        while start < total_all and not stop_event.is_set() and not stop_paging:
             res = None
             for attempt in range(3):
                 try:
@@ -1003,12 +1130,18 @@ def export_folder(client: WebClient, archive: str, folder_path: str,
                     progress.inc(skipped_msgs=1, skip_excluded=1)
                     continue
                 # Year/month filter: applied BEFORE download using the search
-                # result date. Non-matching (and undated) messages are removed
-                # from the total so the progress bar still reaches 100%.
+                # result date. `total` è già riferito al filtro, quindi gli
+                # scartati si contano come skip_filter SENZA decrementare il
+                # totale (a differenza di prima, quando total era il completo).
                 if years or months:
                     yr, mo = _item_year_month(item)
+                    # Early-stop: ordine data DECRESCENTE -> sotto il minimo anno
+                    # selezionato non ci sono più match. Tronca la paginazione.
+                    if years and yr is not None and yr < min(years):
+                        stop_paging = True
+                        break
                     if (years and yr not in years) or (months and mo not in months):
-                        progress.inc(total_msgs=-1, skip_filter=1)
+                        progress.inc(skip_filter=1)
                         continue
 
                 if use_pool:
@@ -1048,7 +1181,11 @@ _TMP_WRITE_BACKOFF = (0.05, 0.1, 0.2, 0.4, 0.8)
 
 
 # Pattern del filename: ..._YYYYMMDD_HHMMSS_HASH8.eml.tmp
-_TMP_DATE_RE = re.compile(r'_(\d{8})_(\d{6})_[a-f0-9]{8}\.eml\.tmp$')
+# I nomi .tmp sono `{subject}_{YYYYMMDD}_{HHMMSS}_{hash8}.eml.tmp` e, dai run
+# con scrittura atomica a nome univoco, `..._{hash8}.{token}.eml.tmp` (token =
+# pid-rand): il gruppo opzionale (?:\.[A-Za-z0-9-]+)? assorbe quel token.
+_TMP_DATE_RE = re.compile(
+    r'_(\d{8})_(\d{6})_[a-f0-9]{8}(?:\.[A-Za-z0-9-]+)?\.eml\.tmp$')
 
 
 def _item_year_month(item: dict) -> tuple[int | None, int | None]:
@@ -1404,14 +1541,16 @@ def _do_download_and_save(client: WebClient, item: dict, archive: str,
             if n > 1000:
                 raise RuntimeError(f'Troppe collisioni per {filename}')
 
-    tmp = target.with_suffix('.eml.tmp')
-    # Se un .tmp è già presente è orfano di un crash precedente (o lockato
-    # da AV/sync): saltiamo l'email senza marcarla in state.db, così il
-    # prossimo resume la riproverà a freddo dopo il cleanup all'avvio.
-    if tmp.exists():
-        logger.warning('Skip .tmp orfano: %s', tmp.name)
-        progress.inc(skipped_msgs=1, skip_tmp=1)
-        return
+    # Nome .tmp UNIVOCO (pid + random a 32 bit). Motivo: su destinazioni che
+    # bloccano i file (disco esterno con ownership, AV, sync, share di rete) un
+    # .tmp lockato può sopravvivere a un fallimento di scrittura. Con un nome
+    # univoco quell'orfano non potrà MAI coincidere col .tmp di un tentativo
+    # futuro: niente più email bloccate "per sempre" nel limbo. Se la scrittura
+    # fallisce davvero, l'eccezione risale e l'email finisce in failed_messages
+    # (recuperabile con --retry-failed). Gli orfani sono pura spazzatura,
+    # ripulita all'avvio (_cleanup_orphan_tmp) e ispezionabile con --scan-tmp.
+    token = f'{os.getpid()}-{random.getrandbits(32):08x}'
+    tmp = target.parent / f'{target.stem}.{token}.eml.tmp'
     _atomic_write_with_retry(tmp, target, raw, logger)
 
     state.mark_api_exported(gid, mid, archive, folder, msg_hash,
@@ -2152,9 +2291,11 @@ def run_reconcile(state: WebApiStateDB, json_out: Path | None = None) -> dict:
     print(f'Falliti (DB):        {tot_fail:,}')
     print(f'GAP non coperti:     {tot_gap:,}')
     print()
-    print('NB: "atteso" è il count della cartella SENZA filtri. Se hai esportato')
-    print('    con --year/--month, gran parte del GAP è semplicemente "escluso')
-    print('    dal filtro", non "perso". Il dato inequivocabile è "falliti".')
+    print('NB: dai run con questa versione "atteso" è già RIFERITO al filtro')
+    print('    anno/mese usato, quindi il GAP è un vero "mancante". Se invece il')
+    print('    folder_counts proviene da run PRECEDENTI (conteggio non filtrato),')
+    print('    parte del GAP può essere "escluso dal filtro". Il dato sempre')
+    print('    inequivocabile resta "falliti".')
     print()
     print('--- Per archivio (ordinati per GAP) ---')
     print(f'{"GAP":>10} {"falliti":>9} {"esport.":>9} {"atteso":>9}  archivio')
@@ -2762,8 +2903,10 @@ def main():
         print('Pre-conteggio messaggi (la barra avrà un totale fisso)…')
         try:
             grand = precount(client, archives, workers, stop_event, logger,
-                             progress, include_re, exclude_re)
-            print(f'  totale da scaricare: {grand:,} messaggi')
+                             progress, include_re, exclude_re,
+                             years=cfg['years'], months=cfg['months'])
+            label = ' (filtrato per anno/mese)' if (cfg['years'] or cfg['months']) else ''
+            print(f'  totale da scaricare{label}: {grand:,} messaggi')
         except AuthExpired:
             print(f'{sym("✗", "X")} Autenticazione fallita.', file=sys.stderr)
             sys.exit(2)

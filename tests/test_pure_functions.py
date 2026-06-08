@@ -340,6 +340,17 @@ class TestParseTmpName(unittest.TestCase):
             'Subject_20230515_143045_abc123de.eml.tmp')
         self.assertEqual(dt, datetime(2023, 5, 15, 14, 30, 45))
 
+    def test_valid_with_unique_token(self):
+        # Nuovo schema a nome univoco: ..._{hash8}.{pid}-{rand}.eml.tmp
+        dt = wex._parse_email_date_from_tmp_name(
+            'Subject_20230515_143045_abc123de.40521-1a2b3c4d.eml.tmp')
+        self.assertEqual(dt, datetime(2023, 5, 15, 14, 30, 45))
+
+    def test_dotted_subject_with_token(self):
+        dt = wex._parse_email_date_from_tmp_name(
+            'Re_ Fattura n.123_20230515_143045_abc123de.99-deadbeef.eml.tmp')
+        self.assertEqual(dt, datetime(2023, 5, 15, 14, 30, 45))
+
     def test_placeholder_date_is_none(self):
         self.assertIsNone(wex._parse_email_date_from_tmp_name(
             'Subject_00000000_000000_abc123de.eml.tmp'))
@@ -435,6 +446,58 @@ class TestIsPermanentFailure(unittest.TestCase):
 
     def test_empty_message_is_transient(self):
         self.assertFalse(wex._is_permanent_failure(0, 'RuntimeError', ''))
+
+
+# ============================================================
+# _count_years_in_sorted (conteggio per anno via ricerca binaria)
+# ============================================================
+
+class TestCountYearsInSorted(unittest.TestCase):
+    @staticmethod
+    def _make_year_at(years_desc):
+        # Lista di anni ordinata in modo DECRESCENTE; restituisce year_at(i).
+        return lambda i: years_desc[i] if 0 <= i < len(years_desc) else None
+
+    def test_single_year_middle_block(self):
+        # 3x2026, 4x2025, 2x2024  -> il 2025 è in mezzo (non all'inizio)
+        ys = [2026, 2026, 2026, 2025, 2025, 2025, 2025, 2024, 2024]
+        cnt, spans = wex._count_years_in_sorted(len(ys), {2025},
+                                                self._make_year_at(ys))
+        self.assertEqual(cnt, 4)
+        self.assertEqual(spans, [(2025, 3, 7)])
+
+    def test_multiple_non_contiguous_years(self):
+        # seleziona 2025 e 2023, salta 2024
+        ys = [2025, 2025, 2024, 2024, 2024, 2023, 2023, 2022]
+        cnt, _ = wex._count_years_in_sorted(len(ys), {2025, 2023},
+                                            self._make_year_at(ys))
+        self.assertEqual(cnt, 4)  # 2 del 2025 + 2 del 2023
+
+    def test_year_not_present(self):
+        ys = [2026, 2026, 2024]
+        cnt, spans = wex._count_years_in_sorted(len(ys), {2025},
+                                                self._make_year_at(ys))
+        self.assertEqual(cnt, 0)
+        self.assertEqual(spans, [])
+
+    def test_undated_tail_excluded(self):
+        # mail senza data (None) scivolano in coda e non contano
+        ys = [2025, 2025, 2024, None, None]
+        cnt, _ = wex._count_years_in_sorted(len(ys), {2025},
+                                            self._make_year_at(ys))
+        self.assertEqual(cnt, 2)
+
+    def test_all_match(self):
+        ys = [2025, 2025, 2025]
+        cnt, _ = wex._count_years_in_sorted(len(ys), {2025},
+                                            self._make_year_at(ys))
+        self.assertEqual(cnt, 3)
+
+    def test_empty_inputs(self):
+        self.assertEqual(wex._count_years_in_sorted(0, {2025}, lambda i: None),
+                         (0, []))
+        self.assertEqual(wex._count_years_in_sorted(5, set(), lambda i: 2025),
+                         (0, []))
 
 
 if __name__ == '__main__':
