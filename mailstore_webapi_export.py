@@ -1660,6 +1660,50 @@ def _atomic_write_with_retry(tmp: Path, target: Path, raw: bytes,
     return max_retries
 
 
+class WriteFailureGuard:
+    """Circuit breaker per i fallimenti di SCRITTURA consecutivi.
+
+    Quando la destinazione viene bloccata (antivirus/ransomware-protection, disco
+    esterno che va read-only o si disconnette, share di rete che cade...) ogni
+    scrittura fallisce all'infinito. Invece di macinare migliaia di errori, dopo
+    `threshold` fallimenti di scrittura CONSECUTIVI (un successo azzera il
+    contatore) fermiamo l'export con un messaggio chiaro. threshold<=0 = disabilitato.
+    """
+
+    def __init__(self, threshold: int, stop_event: threading.Event,
+                 logger: logging.Logger):
+        self.threshold = max(0, int(threshold))
+        self.stop_event = stop_event
+        self.logger = logger
+        self._lock = threading.Lock()
+        self._consec = 0
+        self.total = 0
+        self.tripped = False
+
+    def record_success(self) -> None:
+        if self.threshold <= 0:
+            return
+        with self._lock:
+            self._consec = 0
+
+    def record_write_failure(self, err: Exception) -> None:
+        if self.threshold <= 0:
+            return
+        with self._lock:
+            self._consec += 1
+            self.total += 1
+            if self._consec >= self.threshold and not self.tripped:
+                self.tripped = True
+                self.stop_event.set()
+                msg = (f'{self.threshold} scritture fallite di fila: la cartella '
+                       f'di output è bloccata. Interrompo. Causa tipica su '
+                       f'Windows: antivirus/ransomware-protection, oppure un '
+                       f'disco esterno andato in sola-lettura o disconnesso. '
+                       f'Ultimo errore: {_format_oserror(err) if isinstance(err, OSError) else err}')
+                self.logger.error('[WRITE] CIRCUIT-BREAKER: %s', msg)
+                print(f'\n{sym("✗", "X")}  {msg}\n', file=sys.stderr)
+
+
 def download_and_save(client: WebClient, item: dict, archive: str,
                       output_root: Path, state: WebApiStateDB,
                       progress: Progress, cfg: dict, logger: logging.Logger):
@@ -1688,6 +1732,11 @@ def download_and_save(client: WebClient, item: dict, archive: str,
         except Exception as db_err:
             logger.error('mark_api_failed fallito per %s/%s: %s',
                          gid, mid, db_err)
+        # Circuit breaker: i fallimenti di SCRITTURA sono OSError (EACCES,
+        # WinError, ENOSPC...). Gli errori di rete/API non contano qui.
+        guard = cfg.get('write_guard')
+        if guard is not None and isinstance(e, OSError):
+            guard.record_write_failure(e)
         raise
 
 
@@ -1771,6 +1820,10 @@ def _do_download_and_save(client: WebClient, item: dict, archive: str,
     token = f'{os.getpid()}-{random.getrandbits(32):08x}'
     tmp = target.parent / f'{target.stem}.{token}.eml.tmp'
     _atomic_write_with_retry(tmp, target, raw, logger)
+    # Scrittura riuscita: azzera il contatore del circuit breaker.
+    guard = cfg.get('write_guard')
+    if guard is not None:
+        guard.record_success()
 
     state.mark_api_exported(gid, mid, archive, folder, msg_hash,
                             filename=target.name,
@@ -2693,6 +2746,12 @@ def main():
     parser.add_argument('--workers', type=int, default=32,
                         help='Worker paralleli per download (default 32, '
                              'consigliato 16-64 su LAN gigabit)')
+    parser.add_argument('--max-write-failures', type=int, default=50,
+                        help='Circuit breaker: ferma l\'export dopo N scritture '
+                             'fallite CONSECUTIVE (default 50; 0 = disattivato). '
+                             'Evita di macinare migliaia di errori quando la '
+                             'cartella di output è bloccata (antivirus, disco '
+                             'esterno in sola-lettura/disconnesso, share di rete).')
     parser.add_argument('--dedup-message-id', action='store_true',
                         help='Salta email con Message-ID già visto '
                              '(deduplica cross-archive/folder)')
@@ -3035,6 +3094,9 @@ def main():
     signal.signal(signal.SIGINT, handle_sig)
     signal.signal(signal.SIGTERM, handle_sig)
 
+    # Circuit breaker per le scritture (vedi --max-write-failures).
+    write_guard = WriteFailureGuard(args.max_write_failures, stop_event, logger)
+
     # === BENCHMARK MODE ===
     if args.benchmark:
         bench_json = args.benchmark_output or (
@@ -3124,7 +3186,8 @@ def main():
         retry_cfg = {'workers': workers, 'dedup_message_id': dedup,
                      'split_by_year': split_by_year,
                      'years': set(), 'months': set(),
-                     'excluded_keys': set(), 'known_total': False}
+                     'excluded_keys': set(), 'known_total': False,
+                     'write_guard': write_guard}
         archive_filter = set(archives) if archives else None
         logger.info('RETRY-FAILED MODE: archives=%s skip_permanent=%s',
                     archive_filter or 'ALL', args.retry_skip_permanent)
@@ -3173,7 +3236,8 @@ def main():
            'months': set(args.month or []),
            'date_from': date_from, 'date_to': date_to,
            'excluded_keys': excluded_keys,
-           'known_total': bool(args.count_first)}
+           'known_total': bool(args.count_first),
+           'write_guard': write_guard}
     cfg['date_intervals'] = _build_date_intervals(
         cfg['years'], cfg['months'], date_from, date_to)
     if cfg['date_intervals']:
@@ -3257,6 +3321,13 @@ def main():
     if aborted_auth:
         print(f'{warn}  Autenticazione fallita. Verifica credenziali e rilancia '
               f'(lo state.db riprende da dove si era fermato).')
+    elif write_guard.tripped:
+        print(f'{warn}  STOP per scritture bloccate: {write_guard.total} '
+              f'fallimenti di scrittura (≥{write_guard.threshold} consecutivi).')
+        print(f'   La cartella di output è inaccessibile. Su Windows con disco '
+              f'esterno controlla: disco non in sola-lettura/disconnesso, '
+              f'filesystem NTFS (non exFAT/FAT), antivirus/ransomware-protection.')
+        print(f'   Sistemato il problema, rilancia (resume) o usa --retry-failed.')
     elif stop_event.is_set():
         print(f'{warn}  Export interrotto. Rilancia lo stesso comando per riprendere.')
     else:

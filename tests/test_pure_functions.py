@@ -643,5 +643,49 @@ class TestResetStateDb(unittest.TestCase):
             self.assertIsNone(wex.reset_state_db(Path(d)))
 
 
+# ============================================================
+# WriteFailureGuard (circuit breaker scritture)
+# ============================================================
+
+class _NullLogger:
+    def error(self, *a, **k):
+        pass
+
+
+class TestWriteFailureGuard(unittest.TestCase):
+    def _guard(self, threshold):
+        import threading
+        ev = threading.Event()
+        return wex.WriteFailureGuard(threshold, ev, _NullLogger()), ev
+
+    def test_trips_after_consecutive_failures(self):
+        g, ev = self._guard(3)
+        g.record_write_failure(OSError(13, 'denied'))
+        g.record_write_failure(OSError(13, 'denied'))
+        self.assertFalse(g.tripped)
+        self.assertFalse(ev.is_set())
+        g.record_write_failure(OSError(13, 'denied'))
+        self.assertTrue(g.tripped)
+        self.assertTrue(ev.is_set())          # stop_event signalled
+        self.assertEqual(g.total, 3)
+
+    def test_success_resets_consecutive_counter(self):
+        g, ev = self._guard(3)
+        g.record_write_failure(OSError(13, 'x'))
+        g.record_write_failure(OSError(13, 'x'))
+        g.record_success()                     # azzera la serie
+        g.record_write_failure(OSError(13, 'x'))
+        g.record_write_failure(OSError(13, 'x'))
+        self.assertFalse(g.tripped)            # mai 3 di fila
+        self.assertEqual(g.total, 4)           # ma il totale conta tutti
+
+    def test_threshold_zero_disables(self):
+        g, ev = self._guard(0)
+        for _ in range(100):
+            g.record_write_failure(OSError(13, 'x'))
+        self.assertFalse(g.tripped)
+        self.assertFalse(ev.is_set())
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
