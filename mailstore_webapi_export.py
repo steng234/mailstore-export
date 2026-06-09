@@ -2721,6 +2721,15 @@ def setup_logging(log_path: Path) -> logging.Logger:
 # ============================================================
 
 def main():
+    # Windows console/pipe defaults to cp1252: printing ✓ ⚠ ═ would raise
+    # UnicodeEncodeError and silently kill the FINAL REPORT mid-print. Force
+    # UTF-8 with errors='replace' so output never crashes on any code page.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+
     parser = argparse.ArgumentParser(
         description='Export MailStore via Web Access REST API -> .eml locali',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,

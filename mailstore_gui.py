@@ -193,30 +193,33 @@ T = {
 # config file and switchable at runtime from the header. Default: refined
 # phosphor green (less neon, sharp corners). The user can pick another.
 # ============================================================
+# Palettes tuned to read like a real CRT terminal: ONE pure-black screen (CARD
+# == BG, so cards become TUI boxes drawn straight on the screen, not "web
+# panels"), punchy phosphor text, faint tinted input wells.
 THEMES = {
-    'green': {  # refined phosphor green (default) — mature, not neon
-        'BG': '#000000', 'CARD': '#0a0f0a', 'FIELD': '#0e160e',
-        'FIELD_HI': '#172517', 'FG': '#42c873', 'MUTED': '#2f8a50',
-        'BORDER': '#245c37', 'ACCENT': '#54e487', 'ACCENT_HI': '#8ff0b0',
-        'ACCENT_LO': '#34ab60', 'DANGER': '#e06a6a', 'DANGER_HI': '#f29494',
+    'green': {  # classic phosphor green on black
+        'BG': '#000000', 'CARD': '#000000', 'FIELD': '#03160c',
+        'FIELD_HI': '#06240f', 'FG': '#33ff66', 'MUTED': '#1f9d52',
+        'BORDER': '#1c7a3f', 'ACCENT': '#52ff85', 'ACCENT_HI': '#9dffbd',
+        'ACCENT_LO': '#2bd463', 'DANGER': '#ff5f56', 'DANGER_HI': '#ff8a82',
     },
-    'amber': {  # VT220 amber CRT — warm monochrome
-        'BG': '#000000', 'CARD': '#120c00', 'FIELD': '#1b1200',
-        'FIELD_HI': '#271a00', 'FG': '#ffb000', 'MUTED': '#9c6f12',
-        'BORDER': '#5a3d00', 'ACCENT': '#ffc233', 'ACCENT_HI': '#ffd970',
-        'ACCENT_LO': '#cc8c00', 'DANGER': '#ff6a4d', 'DANGER_HI': '#ff9580',
+    'amber': {  # VT220 amber CRT
+        'BG': '#000000', 'CARD': '#000000', 'FIELD': '#180e00',
+        'FIELD_HI': '#281800', 'FG': '#ffb627', 'MUTED': '#a9740d',
+        'BORDER': '#7a5200', 'ACCENT': '#ffc94d', 'ACCENT_HI': '#ffe08a',
+        'ACCENT_LO': '#d99a14', 'DANGER': '#ff6a4d', 'DANGER_HI': '#ff9580',
     },
-    'mono': {  # minimal mainframe — soft grey-green, restrained
-        'BG': '#0c0f0d', 'CARD': '#12160f', 'FIELD': '#191e15',
-        'FIELD_HI': '#232a1d', 'FG': '#b9c4b0', 'MUTED': '#6f7c69',
-        'BORDER': '#384230', 'ACCENT': '#d4ddc9', 'ACCENT_HI': '#edf2e6',
-        'ACCENT_LO': '#9aa790', 'DANGER': '#d98a7a', 'DANGER_HI': '#e8a89a',
+    'mono': {  # monochrome white-grey terminal (IBM 5151-ish)
+        'BG': '#000000', 'CARD': '#000000', 'FIELD': '#121512',
+        'FIELD_HI': '#1d211c', 'FG': '#cfd8cb', 'MUTED': '#7c8878',
+        'BORDER': '#444d40', 'ACCENT': '#eef3ea', 'ACCENT_HI': '#ffffff',
+        'ACCENT_LO': '#aab4a4', 'DANGER': '#ff7b6e', 'DANGER_HI': '#ffa094',
     },
-    'ice': {  # cool cyan mainframe — elegant cold tone
-        'BG': '#000406', 'CARD': '#03100f', 'FIELD': '#06181a',
-        'FIELD_HI': '#0c2528', 'FG': '#5fd0d8', 'MUTED': '#3a8f96',
-        'BORDER': '#1c4f54', 'ACCENT': '#67e8e8', 'ACCENT_HI': '#a5f4f4',
-        'ACCENT_LO': '#3fb6b6', 'DANGER': '#ff6b6b', 'DANGER_HI': '#ff9595',
+    'ice': {  # cold cyan terminal
+        'BG': '#000000', 'CARD': '#000000', 'FIELD': '#021a1c',
+        'FIELD_HI': '#04282b', 'FG': '#3fe0e6', 'MUTED': '#2a949a',
+        'BORDER': '#1a5e63', 'ACCENT': '#5cf2f2', 'ACCENT_HI': '#a5f9f9',
+        'ACCENT_LO': '#34c2c4', 'DANGER': '#ff6b6b', 'DANGER_HI': '#ff9595',
     },
 }
 THEME_ORDER = ['green', 'amber', 'mono', 'ice']
@@ -941,19 +944,32 @@ class MailStoreGUI:
 
     def _fonts(self) -> None:
         base = tkfont.nametofont('TkDefaultFont')
-        fam = 'Menlo'  # monospace EVERYWHERE for the terminal look
+        # Pick a monospace family that ACTUALLY EXISTS on this platform. NB: Tk
+        # silently substitutes an unknown family (configure() does NOT raise),
+        # so checking tkfont.families() ourselves is the only reliable way —
+        # otherwise on Windows 'Menlo' is absent and Tk falls back to a
+        # proportional font, wrecking the whole terminal look + progress bar.
         try:
-            base.configure(family=fam, size=8)
+            available = set(tkfont.families(self.root))
+        except Exception:
+            available = set()
+        prefs = ('Menlo', 'Consolas', 'Cascadia Mono', 'DejaVu Sans Mono',
+                 'Liberation Mono', 'Lucida Console', 'Courier New', 'Monaco',
+                 'Courier')
+        fam = next((f for f in prefs if f in available), None) or 'Courier New'
+        try:
+            base.configure(family=fam, size=9)
         except tk.TclError:
             fam = base.cget('family')
+        self.font_family = fam
         self.font_base = base
-        self.font_h1 = tkfont.Font(family=fam, size=12, weight='bold')
-        self.font_h2 = tkfont.Font(family=fam, size=9, weight='bold')
-        self.font_btn = tkfont.Font(family=fam, size=8)
-        self.font_btn_b = tkfont.Font(family=fam, size=8, weight='bold')
-        self.font_mono = tkfont.Font(family=fam, size=8)       # terminal feel
-        self.font_mono_s = tkfont.Font(family=fam, size=8)
-        self.font_xs = tkfont.Font(family=fam, size=7)
+        self.font_h1 = tkfont.Font(family=fam, size=13, weight='bold')
+        self.font_h2 = tkfont.Font(family=fam, size=10, weight='bold')
+        self.font_btn = tkfont.Font(family=fam, size=9)
+        self.font_btn_b = tkfont.Font(family=fam, size=9, weight='bold')
+        self.font_mono = tkfont.Font(family=fam, size=9)       # terminal feel
+        self.font_mono_s = tkfont.Font(family=fam, size=9)
+        self.font_xs = tkfont.Font(family=fam, size=8)
 
     def _apply_style(self) -> None:
         style = ttk.Style()
@@ -1224,6 +1240,12 @@ class MailStoreGUI:
                            selectbackground=ACCENT, selectforeground=BG,
                            relief='flat', highlightthickness=0, bd=0,
                            font=self.font_mono)
+        # ANSI-style semantic colouring of the console output.
+        self.log.tag_configure('err', foreground=DANGER)
+        self.log.tag_configure('ok', foreground=ACCENT)
+        self.log.tag_configure('warn', foreground='#e6b84d')  # amber = warning
+        self.log.tag_configure('folder', foreground=ACCENT_HI)
+        self.log.tag_configure('dim', foreground=MUTED)
         logsb = RScroll(lb, self.log.yview, parent_bg=CARD)
         self.log.configure(yscrollcommand=logsb.set, state='disabled')
         self.log.grid(row=1, column=0, sticky='nsew')
@@ -1683,6 +1705,13 @@ class MailStoreGUI:
         self._log_line(f'$ {label}  (avvio…)')
         env = dict(os.environ)
         env['PYTHONUNBUFFERED'] = '1'
+        # Force UTF-8 on the child's stdout. On Windows a piped stdout defaults
+        # to the ANSI code page (cp1252); printing ✓ ⚠ ═ etc. then raises
+        # UnicodeEncodeError and the FINAL REPORT silently dies mid-print. The
+        # reader decodes UTF-8, so this makes the report (and accented text)
+        # show up correctly.
+        env['PYTHONUTF8'] = '1'
+        env['PYTHONIOENCODING'] = 'utf-8'
         try:
             self.proc = subprocess.Popen(
                 argv, cwd=str(APP_DIR), env=env,
@@ -1787,13 +1816,31 @@ class MailStoreGUI:
     def _log_line(self, text: str) -> None:
         self._commit_line(text)
 
+    @staticmethod
+    def _line_tag(text: str) -> str:
+        """Semantic colour tag for a console line (ANSI-terminal feel)."""
+        low = text.lower()
+        s = text.lstrip()
+        if ('fallita' in low or 'errore' in low or '[error]' in low
+                or 'denied' in low or 'winerror' in low or 'eacces' in low
+                or 'permission' in low or s.startswith('✗') or 'error]' in low):
+            return 'err'
+        if '[folder]' in low:
+            return 'folder'
+        if (s.startswith('✓') or 'completat' in low or '[write] ok' in low
+                or 'recuperati' in low):
+            return 'ok'
+        if '⚠' in text or s.startswith('!') or 'warn' in low or 'scaduta' in low:
+            return 'warn'
+        if s.startswith('$') or s.startswith('==='):
+            return 'dim'
+        return 'fg'  # default foreground (no special tag)
+
     def _commit_line(self, text: str) -> None:
         self._log_enable()
         if self._transient_line:
             self.log.delete('end-1l linestart', 'end-1c')
-            self.log.insert('end', text)
-        else:
-            self.log.insert('end', text)
+        self.log.insert('end', text, self._line_tag(text))
         self.log.insert('end', '\n')
         self._transient_line = False
         self._log_disable()
@@ -1804,9 +1851,7 @@ class MailStoreGUI:
         self._log_enable()
         if self._transient_line:
             self.log.delete('end-1l linestart', 'end-1c')
-            self.log.insert('end', text)
-        else:
-            self.log.insert('end', text)
+        self.log.insert('end', text, self._line_tag(text))
         self._transient_line = True
         self._log_disable()
 
