@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import codecs
 import datetime
+import json
 import os
 import queue
 import re
@@ -187,21 +188,87 @@ T = {
     },
 }
 
-# Phosphor-green terminal palette.
-BG = '#000000'        # pure black (window)
-CARD = '#050b05'      # near-black green-tinted (cards)
-FIELD = '#0a140a'     # inputs
-FIELD_HI = '#122414'  # hover
-FG = '#5af78e'        # phosphor green (primary text)
-MUTED = '#3f9a5e'     # dim green (secondary text)
-BORDER = '#1c4a2c'    # green outline
-ACCENT = '#2bff6a'    # bright phosphor
-ACCENT_HI = '#86ffb0' # hover
-ACCENT_LO = '#1fcc55' # pressed
-OK = '#2bff6a'
-DANGER = '#ff5c5c'    # stop stays red for clarity
-DANGER_HI = '#ff8a8a'
-LOG_BG = '#000000'
+# ============================================================
+# THEME SYSTEM — curated "legacy but elegant" palettes, persisted to a small
+# config file and switchable at runtime from the header. Default: refined
+# phosphor green (less neon, sharp corners). The user can pick another.
+# ============================================================
+THEMES = {
+    'green': {  # refined phosphor green (default) — mature, not neon
+        'BG': '#000000', 'CARD': '#0a0f0a', 'FIELD': '#0e160e',
+        'FIELD_HI': '#172517', 'FG': '#42c873', 'MUTED': '#2f8a50',
+        'BORDER': '#245c37', 'ACCENT': '#54e487', 'ACCENT_HI': '#8ff0b0',
+        'ACCENT_LO': '#34ab60', 'DANGER': '#e06a6a', 'DANGER_HI': '#f29494',
+    },
+    'amber': {  # VT220 amber CRT — warm monochrome
+        'BG': '#000000', 'CARD': '#120c00', 'FIELD': '#1b1200',
+        'FIELD_HI': '#271a00', 'FG': '#ffb000', 'MUTED': '#9c6f12',
+        'BORDER': '#5a3d00', 'ACCENT': '#ffc233', 'ACCENT_HI': '#ffd970',
+        'ACCENT_LO': '#cc8c00', 'DANGER': '#ff6a4d', 'DANGER_HI': '#ff9580',
+    },
+    'mono': {  # minimal mainframe — soft grey-green, restrained
+        'BG': '#0c0f0d', 'CARD': '#12160f', 'FIELD': '#191e15',
+        'FIELD_HI': '#232a1d', 'FG': '#b9c4b0', 'MUTED': '#6f7c69',
+        'BORDER': '#384230', 'ACCENT': '#d4ddc9', 'ACCENT_HI': '#edf2e6',
+        'ACCENT_LO': '#9aa790', 'DANGER': '#d98a7a', 'DANGER_HI': '#e8a89a',
+    },
+    'ice': {  # cool cyan mainframe — elegant cold tone
+        'BG': '#000406', 'CARD': '#03100f', 'FIELD': '#06181a',
+        'FIELD_HI': '#0c2528', 'FG': '#5fd0d8', 'MUTED': '#3a8f96',
+        'BORDER': '#1c4f54', 'ACCENT': '#67e8e8', 'ACCENT_HI': '#a5f4f4',
+        'ACCENT_LO': '#3fb6b6', 'DANGER': '#ff6b6b', 'DANGER_HI': '#ff9595',
+    },
+}
+THEME_ORDER = ['green', 'amber', 'mono', 'ice']
+THEME_LABEL = {'green': 'grn', 'amber': 'amb', 'mono': 'mno', 'ice': 'ice'}
+
+SHARP = True  # legacy: sharp corners (no rounding) on every canvas panel
+
+_CONFIG_PATH = Path.home() / '.mailstore_export_gui.json'
+
+
+def _load_config() -> dict:
+    try:
+        with open(_CONFIG_PATH, 'r', encoding='utf-8') as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_config(**kw) -> None:
+    cfg = _load_config()
+    cfg.update(kw)
+    try:
+        with open(_CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, indent=2)
+    except Exception:
+        pass
+
+
+# Active palette as module globals (read by widgets at draw/call time).
+BG = CARD = FIELD = FIELD_HI = FG = MUTED = BORDER = ACCENT = '#000000'
+ACCENT_HI = ACCENT_LO = OK = DANGER = DANGER_HI = LOG_BG = '#000000'
+
+
+def apply_theme(name: str) -> str:
+    """Set the module-level palette globals from THEMES[name]. Returns the
+    resolved theme name (falls back to 'green' if unknown)."""
+    global BG, CARD, FIELD, FIELD_HI, FG, MUTED, BORDER, ACCENT
+    global ACCENT_HI, ACCENT_LO, OK, DANGER, DANGER_HI, LOG_BG
+    if name not in THEMES:
+        name = 'green'
+    p = THEMES[name]
+    BG, CARD, FIELD, FIELD_HI = p['BG'], p['CARD'], p['FIELD'], p['FIELD_HI']
+    FG, MUTED, BORDER = p['FG'], p['MUTED'], p['BORDER']
+    ACCENT, ACCENT_HI, ACCENT_LO = p['ACCENT'], p['ACCENT_HI'], p['ACCENT_LO']
+    OK, DANGER, DANGER_HI, LOG_BG = p['ACCENT'], p['DANGER'], p['DANGER_HI'], p['BG']
+    return name
+
+
+# Apply the saved (or default) theme NOW, before the widget classes below use
+# these globals as default argument values.
+apply_theme(_load_config().get('theme', 'green'))
 
 PROG_RE = re.compile(
     r'\[(?P<df>\d+)/(?P<tf>\d+) folders\]\s+'
@@ -241,6 +308,22 @@ def _round_pts(x1, y1, x2, y2, r):
     ]
 
 
+def _panel(cv, x1, y1, x2, y2, r=0, *, fill, outline=None, width=1, tags=None):
+    """Draw a filled panel on a Canvas. Legacy mode (SHARP) => crisp rectangle
+    with square corners; otherwise a smoothed rounded polygon. Same call shape
+    for both so widgets don't care which is active."""
+    outline = fill if outline is None else outline
+    if SHARP:
+        kw = dict(fill=fill, outline=outline, width=width)
+        if tags is not None:
+            kw['tags'] = tags
+        return cv.create_rectangle(x1, y1, x2, y2, **kw)
+    kw = dict(smooth=True, fill=fill, outline=outline, width=width)
+    if tags is not None:
+        kw['tags'] = tags
+    return cv.create_polygon(_round_pts(x1, y1, x2, y2, r), **kw)
+
+
 # ============================================================
 # Rounded widget toolkit (Canvas-based)
 # ============================================================
@@ -248,8 +331,10 @@ def _round_pts(x1, y1, x2, y2, r):
 class Card(tk.Frame):
     """A rounded card. Add child widgets to `.body` (bg = CARD)."""
 
-    def __init__(self, master, title=None, *, parent_bg=BG, bg=CARD,
-                 radius=16, padding=16, title_font=None):
+    def __init__(self, master, title=None, *, parent_bg=None, bg=None,
+                 radius=14, padding=16, title_font=None):
+        parent_bg = BG if parent_bg is None else parent_bg
+        bg = CARD if bg is None else bg
         super().__init__(master, bg=parent_bg)
         self._bg = bg
         self._r = radius
@@ -260,9 +345,9 @@ class Card(tk.Frame):
         self.body = tk.Frame(self.canvas, bg=bg)
         if title:
             # grid (not pack) so callers can grid their own widgets into body too.
-            tk.Label(self.body, text=f'> {title.upper()}', bg=bg, fg=ACCENT_HI,
-                     font=title_font).grid(row=0, column=0, columnspan=99,
-                                           sticky='w', pady=(0, 8))
+            tk.Label(self.body, text=f'▌ {title.upper()}', bg=bg,
+                     fg=ACCENT_HI, font=title_font).grid(
+                row=0, column=0, columnspan=99, sticky='w', pady=(0, 8))
         self._win = self.canvas.create_window(padding, padding, window=self.body,
                                               anchor='nw')
         self.canvas.bind('<Configure>', self._on_canvas)
@@ -272,10 +357,9 @@ class Card(tk.Frame):
         if w <= 2 or h <= 2:
             return
         self.canvas.delete('bg')
-        # inset by 2px so the rounded corners are never clipped at the edges
-        self.canvas.create_polygon(_round_pts(2, 2, w - 2, h - 2, self._r),
-                                   smooth=True, fill=self._bg, outline=BORDER,
-                                   width=1, tags='bg')
+        # inset by 2px so the border is never clipped at the edges
+        _panel(self.canvas, 2, 2, w - 2, h - 2, self._r,
+               fill=self._bg, outline=BORDER, width=1, tags='bg')
         self.canvas.tag_lower('bg')
 
     def _on_canvas(self, e):
@@ -294,9 +378,13 @@ class Card(tk.Frame):
 class RBtn(tk.Canvas):
     """A rounded, hoverable button."""
 
-    def __init__(self, master, text, command=None, *, parent_bg=CARD, bg=FIELD,
-                 fg=FG, hover=FIELD_HI, pressed=None, radius=10, padx=16, pady=9,
+    def __init__(self, master, text, command=None, *, parent_bg=None, bg=None,
+                 fg=None, hover=None, pressed=None, radius=8, padx=16, pady=9,
                  font=None):
+        parent_bg = CARD if parent_bg is None else parent_bg
+        bg = FIELD if bg is None else bg
+        fg = FG if fg is None else fg
+        hover = FIELD_HI if hover is None else hover
         self._font = font or tkfont.nametofont('TkDefaultFont')
         w = self._font.measure(text) + 2 * padx
         h = self._font.metrics('linespace') + 2 * pady
@@ -321,8 +409,11 @@ class RBtn(tk.Canvas):
         self.delete('all')
         fg = self._fg if self._enabled else MUTED
         bg = color if self._enabled else FIELD
-        self.create_polygon(_round_pts(0, 0, self._bw, self._bh, self._r),
-                            smooth=True, fill=bg, outline=bg)
+        # Subtle 1px outline gives the legacy "key" look on neutral buttons;
+        # filled accent/danger buttons keep a flush edge.
+        outline = BORDER if bg in (FIELD, FIELD_HI) else bg
+        _panel(self, 0, 0, self._bw - 1, self._bh - 1, self._r,
+               fill=bg, outline=outline, width=1)
         self.create_text(self._bw / 2, self._bh / 2, text=self._text, fill=fg,
                          font=self._font)
 
@@ -342,8 +433,11 @@ class RBtn(tk.Canvas):
 class REntry(tk.Canvas):
     """A rounded text entry wrapping a borderless tk.Entry."""
 
-    def __init__(self, master, textvariable, *, parent_bg=CARD, bg=FIELD, fg=FG,
-                 show=None, radius=10, height=34, font=None, width=160, icon=None):
+    def __init__(self, master, textvariable, *, parent_bg=None, bg=None, fg=None,
+                 show=None, radius=8, height=32, font=None, width=160, icon=None):
+        parent_bg = CARD if parent_bg is None else parent_bg
+        bg = FIELD if bg is None else bg
+        fg = FG if fg is None else fg
         super().__init__(master, width=width, height=height, bg=parent_bg,
                          highlightthickness=0, bd=0)
         self._bg = bg
@@ -366,8 +460,8 @@ class REntry(tk.Canvas):
     def _on(self, e):
         self.delete('shape')
         self.delete('icon')
-        self.create_polygon(_round_pts(1, 1, e.width - 1, e.height - 1, self._r),
-                            smooth=True, fill=self._bg, outline=BORDER, tags='shape')
+        _panel(self, 1, 1, e.width - 1, e.height - 1, self._r,
+               fill=self._bg, outline=BORDER, width=1, tags='shape')
         self.tag_lower('shape')
         left = 12
         if self._icon == 'search':
@@ -380,8 +474,11 @@ class REntry(tk.Canvas):
 class RProgress(tk.Canvas):
     """A rounded progress bar with determinate + indeterminate (marquee) modes."""
 
-    def __init__(self, master, *, parent_bg=BG, trough=FIELD, fill=ACCENT,
-                 height=16, radius=8):
+    def __init__(self, master, *, parent_bg=None, trough=None, fill=None,
+                 height=14, radius=0):
+        parent_bg = BG if parent_bg is None else parent_bg
+        trough = FIELD if trough is None else trough
+        fill = ACCENT if fill is None else fill
         super().__init__(master, height=height, bg=parent_bg,
                          highlightthickness=0, bd=0)
         self._trough = trough
@@ -426,14 +523,14 @@ class RProgress(tk.Canvas):
     def _fill_rect(self, x1, x2):
         if x2 - x1 < 2:
             return
-        self.create_polygon(_round_pts(x1, 0, x2, self._h, self._r),
-                            smooth=True, fill=self._fill, outline=self._fill)
+        _panel(self, x1, 0, x2, self._h, self._r,
+               fill=self._fill, outline=self._fill)
 
     def _redraw(self):
         w = self.winfo_width() or 1
         self.delete('all')
-        self.create_polygon(_round_pts(0, 0, w, self._h, self._r),
-                            smooth=True, fill=self._trough, outline=self._trough)
+        _panel(self, 0, 0, w, self._h, self._r,
+               fill=self._trough, outline=BORDER, width=1)
         if self._mode == 'determinate':
             self._fill_rect(0, w * (self._value / self._max))
         else:
@@ -445,8 +542,9 @@ class RProgress(tk.Canvas):
 class RScroll(tk.Canvas):
     """A thin, rounded, draggable scrollbar. `command` is a widget's yview."""
 
-    def __init__(self, master, command, *, parent_bg=CARD, width=10,
-                 thumb=ACCENT, thumb_hi=ACCENT_HI, trough=None, radius=5):
+    def __init__(self, master, command, *, parent_bg=None, width=10,
+                 thumb=None, thumb_hi=None, trough=None, radius=0):
+        parent_bg = CARD if parent_bg is None else parent_bg
         # height=10: a tk.Canvas defaults to ~7c (~265px), which would inflate any
         # grid row it sits in. Keep it tiny; sticky='ns' stretches it to fit.
         super().__init__(master, width=width, height=10, bg=parent_bg,
@@ -454,7 +552,8 @@ class RScroll(tk.Canvas):
         self._cmd = command
         self._first, self._last = 0.0, 1.0
         self._bw = width
-        self._thumb, self._thumb_hi = thumb, thumb_hi
+        self._thumb = ACCENT if thumb is None else thumb
+        self._thumb_hi = ACCENT_HI if thumb_hi is None else thumb_hi
         self._trough = trough or parent_bg
         self._r = radius
         self._drag = None
@@ -480,14 +579,14 @@ class RScroll(tk.Canvas):
         h, y1, y2 = self._geom()
         w = self._bw
         self.delete('all')
-        self.create_polygon(_round_pts(0, 0, w, h, self._r), smooth=True,
-                            fill=self._trough, outline=self._trough)
+        _panel(self, 0, 0, w, h, self._r,
+               fill=self._trough, outline=self._trough)
         if self._last - self._first >= 0.999:
             return  # nothing to scroll
         col = self._thumb_hi if (self._hot or self._drag is not None) else self._thumb
         m = 2
-        self.create_polygon(_round_pts(m, y1 + m, w - m, y2 - m, (w - 2 * m) / 2),
-                            smooth=True, fill=col, outline=col)
+        _panel(self, m, y1 + m, w - m, y2 - m, (w - 2 * m) / 2,
+               fill=col, outline=col)
 
     def _on_press(self, e):
         h, y1, y2 = self._geom()
@@ -515,8 +614,9 @@ class RCheck(tk.Canvas):
     """Terminal-style checkbox: rounded green box on black, black tick when on.
     Bound to a tk.BooleanVar so it works like a ttk.Checkbutton."""
 
-    def __init__(self, master, text, variable, *, parent_bg=CARD, font=None,
+    def __init__(self, master, text, variable, *, parent_bg=None, font=None,
                  disabled=False, command=None, box=14, gap=10):
+        parent_bg = CARD if parent_bg is None else parent_bg
         self._font = font or tkfont.nametofont('TkDefaultFont')
         self._box = box
         self._gap = gap
@@ -568,8 +668,8 @@ class RCheck(tk.Canvas):
             border = ACCENT_HI if self._hot else ACCENT
             text_col = FG
             fill = ACCENT if on else BG
-        self.create_polygon(_round_pts(x0, y0, x0 + box, y0 + box, 4),
-                            smooth=True, fill=fill, outline=border, width=1)
+        _panel(self, x0, y0, x0 + box, y0 + box, 3,
+               fill=fill, outline=border, width=1)
         if on:
             tick = [x0 + 0.26 * box, y0 + 0.54 * box,
                     x0 + 0.43 * box, y0 + 0.72 * box,
@@ -584,9 +684,10 @@ class MultiDropdown(tk.Canvas):
     """Rounded, terminal-styled MULTI-select dropdown: a field showing the current
     selection that opens a scrollable checklist popup on click."""
 
-    def __init__(self, master, options, *, parent_bg=CARD, font=None, mono=None,
-                 placeholder='Tutti', width=240, height=34, radius=10,
+    def __init__(self, master, options, *, parent_bg=None, font=None, mono=None,
+                 placeholder='Tutti', width=240, height=32, radius=8,
                  on_change=None, popup_rows=10):
+        parent_bg = CARD if parent_bg is None else parent_bg
         super().__init__(master, width=width, height=height, bg=parent_bg,
                          highlightthickness=0, bd=0)
         self._opts = [str(o) for o in options]
@@ -631,8 +732,8 @@ class MultiDropdown(tk.Canvas):
         w = self.winfo_width() or int(self['width'])
         h = int(self['height'])
         outline = ACCENT if self._popup else BORDER
-        self.create_polygon(_round_pts(1, 1, w - 1, h - 1, self._r), smooth=True,
-                            fill=FIELD, outline=outline, width=1)
+        _panel(self, 1, 1, w - 1, h - 1, self._r,
+               fill=FIELD, outline=outline, width=1)
         sel = self.selected()
         self.create_text(12, h / 2, text=self._summary(), anchor='w',
                          fill=(FG if sel else MUTED), font=self._mono)
@@ -731,7 +832,9 @@ class MailStoreGUI:
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.lang = 'it'
+        _cfg = _load_config()
+        self.lang = _cfg.get('lang') if _cfg.get('lang') in T else 'it'
+        self.theme = apply_theme(_cfg.get('theme', 'green'))
         root.title('MailStore — Export Web API')
         root.minsize(560, 460)  # narrow is fine: the whole page scrolls
         root.geometry('850x710')
@@ -786,13 +889,32 @@ class MailStoreGUI:
     def _set_lang(self, lang: str) -> None:
         if lang == self.lang or lang not in T:
             return
-        # capture state that lives in widgets we are about to destroy
-        years = self._selected_years()
-        months = [self._months().index(m) for m in self.month_dd.selected()]
-        log_text = self.log.get('1.0', 'end-1c')
         self.lang = lang
         self.var_status.set(self.t('ready'))
         self.var_prog_text.set(self.t('waiting'))
+        _save_config(lang=lang)
+        self._rebuild_ui()
+
+    def _set_theme(self, name: str) -> None:
+        if name == self.theme or name not in THEMES:
+            return
+        self.theme = apply_theme(name)      # reassign the palette globals
+        _save_config(theme=name)
+        self.root.configure(bg=BG)
+        self._apply_style()                 # refresh ttk label/scrollbar colors
+        self._rebuild_ui()
+
+    def _rebuild_ui(self) -> None:
+        """Tear down and rebuild the whole page preserving form state. Shared by
+        language and theme switches (both recreate every widget so the new
+        strings / palette take effect)."""
+        # Capture state living in widgets we are about to destroy. Months are
+        # captured by POSITION (not localized name) so it survives a lang change.
+        years = self._selected_years()
+        mnames = list(self.month_dd._vars)
+        months = [i for i, n in enumerate(mnames)
+                  if self.month_dd._vars[n].get()]
+        log_text = self.log.get('1.0', 'end-1c')
         for w in self.root.winfo_children():
             w.destroy()
         self._build_ui()
@@ -805,10 +927,10 @@ class MailStoreGUI:
                 self.year_dd._vars[str(y)].set(True)
         self.year_dd._draw()
         self._update_months()
+        new_names = list(self.month_dd._vars)
         for i in months:
-            names = list(self.month_dd._vars)
-            if 0 <= i < len(names):
-                self.month_dd._vars[names[i]].set(True)
+            if 0 <= i < len(new_names):
+                self.month_dd._vars[new_names[i]].set(True)
         self.month_dd._draw()
         if log_text:
             self._log_enable()
@@ -906,7 +1028,18 @@ class MailStoreGUI:
             RBtn(langbar, f'[ {LANG_LABEL[code]} ]',
                  (lambda c=code: self._set_lang(c)), parent_bg=BG,
                  bg=(ACCENT if active else FIELD),
-                 fg=('#001a08' if active else FG),
+                 fg=(BG if active else FG),
+                 hover=(ACCENT_HI if active else FIELD_HI),
+                 font=self.font_btn).pack(side='right', padx=2)
+        # theme picker, just left of the language picker
+        themebar = tk.Frame(header, bg=BG)
+        themebar.pack(side='right', padx=(0, 14))
+        for code in reversed(THEME_ORDER):
+            active = code == self.theme
+            RBtn(themebar, f'[ {THEME_LABEL[code]} ]',
+                 (lambda c=code: self._set_theme(c)), parent_bg=BG,
+                 bg=(ACCENT if active else FIELD),
+                 fg=(BG if active else FG),
                  hover=(ACCENT_HI if active else FIELD_HI),
                  font=self.font_btn).pack(side='right', padx=2)
 
@@ -1085,10 +1218,12 @@ class MailStoreGUI:
         lb = logc.body
         lb.columnconfigure(0, weight=1)
         log_lines = max(3, round(145 / self.font_mono.metrics('linespace')))  # ~145px
+        # Monochrome themed log: phosphor text on black for the terminal look.
         self.log = tk.Text(lb, height=log_lines, wrap='none', background=LOG_BG,
-                           foreground='#cdd6df', insertbackground='#cdd6df',
-                           selectbackground=ACCENT, relief='flat',
-                           highlightthickness=0, bd=0, font=self.font_mono)
+                           foreground=FG, insertbackground=FG,
+                           selectbackground=ACCENT, selectforeground=BG,
+                           relief='flat', highlightthickness=0, bd=0,
+                           font=self.font_mono)
         logsb = RScroll(lb, self.log.yview, parent_bg=CARD)
         self.log.configure(yscrollcommand=logsb.set, state='disabled')
         self.log.grid(row=1, column=0, sticky='nsew')
