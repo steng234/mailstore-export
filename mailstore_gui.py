@@ -91,7 +91,7 @@ T = {
         'analyze': '[ analizza ]', 'benchmark': '[ benchmark ]',
         'scantmp': '[ scan .tmp ]', 'failed': '[ lista falliti ]',
         'doctor': '[ doctor ]', 'reconcile': '[ riconcilia ]',
-        'retry': '[ ↻ ritenta falliti ]', 'reset_state': '[ ⟲ reset state.db ]',
+        'retry': '[ ritenta falliti ]', 'reset_state': '[ reset state.db ]',
         'stop': '[ ■ STOP ]', 'ready': 'Pronto.',
         'waiting': "In attesa di un'operazione…", 'lang': 'Lingua',
         'months_abbr': ['Gen', 'Feb', 'Mar', 'Apr', 'Mag', 'Giu',
@@ -120,7 +120,7 @@ T = {
         'analyze': '[ analyze ]', 'benchmark': '[ benchmark ]',
         'scantmp': '[ scan .tmp ]', 'failed': '[ failed list ]',
         'doctor': '[ doctor ]', 'reconcile': '[ reconcile ]',
-        'retry': '[ ↻ retry failed ]', 'reset_state': '[ ⟲ reset state.db ]',
+        'retry': '[ retry failed ]', 'reset_state': '[ reset state.db ]',
         'stop': '[ ■ STOP ]', 'ready': 'Ready.',
         'waiting': 'Waiting for an operation…', 'lang': 'Language',
         'months_abbr': ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
@@ -150,7 +150,7 @@ T = {
         'analyze': '[ analizar ]', 'benchmark': '[ benchmark ]',
         'scantmp': '[ scan .tmp ]', 'failed': '[ lista fallidos ]',
         'doctor': '[ doctor ]', 'reconcile': '[ reconciliar ]',
-        'retry': '[ ↻ reintentar ]', 'reset_state': '[ ⟲ reset state.db ]',
+        'retry': '[ reintentar ]', 'reset_state': '[ reset state.db ]',
         'stop': '[ ■ STOP ]', 'ready': 'Listo.',
         'waiting': 'Esperando una operación…', 'lang': 'Idioma',
         'months_abbr': ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun',
@@ -180,7 +180,7 @@ T = {
         'analyze': '[ analyser ]', 'benchmark': '[ benchmark ]',
         'scantmp': '[ scan .tmp ]', 'failed': '[ liste échecs ]',
         'doctor': '[ doctor ]', 'reconcile': '[ réconcilier ]',
-        'retry': '[ ↻ réessayer ]', 'reset_state': '[ ⟲ reset state.db ]',
+        'retry': '[ réessayer ]', 'reset_state': '[ reset state.db ]',
         'stop': '[ ■ STOP ]', 'ready': 'Prêt.',
         'waiting': 'En attente d’une opération…', 'lang': 'Langue',
         'months_abbr': ['Jan', 'Fév', 'Mar', 'Avr', 'Mai', 'Jun',
@@ -745,7 +745,7 @@ class MultiDropdown(tk.Canvas):
         sel = self.selected()
         self.create_text(12, h / 2, text=self._summary(), anchor='w',
                          fill=(FG if sel else MUTED), font=self._mono)
-        self.create_text(w - 16, h / 2, text=('▲' if self._popup else '▾'),
+        self.create_text(w - 16, h / 2, text=('▲' if self._popup else '▼'),
                          anchor='w', fill=ACCENT, font=self._font)
 
     def _on_pick(self) -> None:
@@ -1734,6 +1734,7 @@ class MailStoreGUI:
     def _reader(self, proc: subprocess.Popen) -> None:
         dec = codecs.getincrementaldecoder('utf-8')('replace')
         cur = ''
+        pending_cr = False  # saw a CR, waiting to see if it's CRLF or a lone CR
         fd = proc.stdout
         try:
             while True:
@@ -1741,16 +1742,27 @@ class MailStoreGUI:
                 if not chunk:
                     break
                 for ch in dec.decode(chunk):
+                    if pending_cr:
+                        pending_cr = False
+                        if ch == '\n':
+                            # CRLF (Windows newline) = commit the line as-is.
+                            self.events.put(('line', cur)); cur = ''
+                            continue
+                        # Lone CR = in-place update (progress bar). Flush, then
+                        # fall through to process the current char.
+                        self.events.put(('replace', cur)); cur = ''
                     if ch == '\n':
                         self.events.put(('line', cur)); cur = ''
                     elif ch == '\r':
-                        self.events.put(('replace', cur)); cur = ''
+                        pending_cr = True       # decide on the NEXT char
                     else:
                         cur += ch
         except Exception:
             pass
         finally:
-            if cur:
+            if pending_cr and cur:
+                self.events.put(('replace', cur))
+            elif cur:
                 self.events.put(('line', cur))
             rc = proc.wait()
             self.events.put(('done', rc))
@@ -1929,8 +1941,32 @@ class MailStoreGUI:
         self.root.destroy()
 
 
+def _enable_windows_dpi_awareness() -> None:
+    """On Windows, opt into per-monitor DPI awareness BEFORE creating the Tk
+    root. Without it the whole UI is tiny or blurry on high-DPI displays."""
+    if not sys.platform.startswith('win'):
+        return
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor v2
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()       # legacy fallback
+    except Exception:
+        pass
+
+
 def main() -> None:
+    _enable_windows_dpi_awareness()
     root = tk.Tk()
+    # Match Tk's scaling to the real screen DPI so points->pixels is correct
+    # (96 dpi = 1.0). Keeps fonts/widgets crisp and correctly sized on Windows.
+    try:
+        dpi = root.winfo_fpixels('1i')  # pixels per inch
+        if dpi and dpi > 0:
+            root.tk.call('tk', 'scaling', dpi / 72.0)
+    except Exception:
+        pass
     MailStoreGUI(root)
     root.mainloop()
 
