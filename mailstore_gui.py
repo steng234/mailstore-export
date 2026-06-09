@@ -478,7 +478,7 @@ class RProgress(tk.Canvas):
     """A rounded progress bar with determinate + indeterminate (marquee) modes."""
 
     def __init__(self, master, *, parent_bg=None, trough=None, fill=None,
-                 height=14, radius=0):
+                 height=18, radius=0):
         parent_bg = BG if parent_bg is None else parent_bg
         trough = FIELD if trough is None else trough
         fill = ACCENT if fill is None else fill
@@ -524,22 +524,27 @@ class RProgress(tk.Canvas):
         self._anim = self.after(30, self._animate)
 
     def _fill_rect(self, x1, x2):
-        if x2 - x1 < 2:
+        # Fill sits INSIDE the bordered trough (1px inset) so the frame stays
+        # visible even at 100%.
+        if x2 - x1 < 1:
             return
-        _panel(self, x1, 0, x2, self._h, self._r,
+        _panel(self, x1, 2, x2, self._h - 3, self._r,
                fill=self._fill, outline=self._fill)
 
     def _redraw(self):
         w = self.winfo_width() or 1
         self.delete('all')
-        _panel(self, 0, 0, w, self._h, self._r,
+        # Inset by 1px on every side: drawing up to the exact canvas edge clips
+        # the bottom/right border and the bar looks "cut".
+        _panel(self, 0, 0, w - 1, self._h - 1, self._r,
                fill=self._trough, outline=BORDER, width=1)
+        inner = max(1, w - 4)
         if self._mode == 'determinate':
-            self._fill_rect(0, w * (self._value / self._max))
+            self._fill_rect(2, 2 + inner * (self._value / self._max))
         else:
-            seg = w * 0.28
-            x = self._pos * (w + seg) - seg
-            self._fill_rect(max(0, x), min(w, x + seg))
+            seg = inner * 0.28
+            x = self._pos * (inner + seg) - seg
+            self._fill_rect(2 + max(0, x), 2 + min(inner, x + seg))
 
 
 class RScroll(tk.Canvas):
